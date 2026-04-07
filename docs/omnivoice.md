@@ -122,6 +122,34 @@ For inspection with normal audio tools, wrap it first:
 ffmpeg -y -f s16le -ar 24000 -ac 1 -i /tmp/out.pcm /tmp/out.wav
 ```
 
+One benchmarking caveat:
+
+* `main --tts_export ...` still calls `ffplay` after synthesis when `ffplay` is available.
+* End-to-end CLI wall time therefore includes audio playback time unless playback is disabled or stubbed out.
+* For pure generation benchmarks, keep the model resident in one process and neutralize `ffplay`.
+
+## Vulkan Benchmark Notes
+
+Measured on this machine with:
+
+* backend: Vulkan
+* GPU: AMD Radeon 780M Graphics (`RADV PHOENIX`)
+* model: native OmniVoice (`/tmp/omnivoice-native.bin`)
+* prompt: `这是一次在 AMD 780M 集成显卡上通过 Vulkan 运行原生 OmniVoice 自动音色语音合成的性能测试。`
+* generation: auto voice, `language=Chinese`, `num_step=32`
+* output: 24kHz mono PCM, `8.6s`
+
+Observed numbers:
+
+* end-to-end CLI timing after warmup, including process startup and post-generation playback path: about `20.8s` wall time for `8.6s` audio, or `RTF ~= 2.42`
+* pure generation timing with one resident interactive process and `ffplay` stubbed out: about `12.3s` wall time for `8.6s` audio, or `RTF ~= 1.43`
+
+Interpretation:
+
+* on this 780M Vulkan path, native OmniVoice auto TTS is not yet real-time at `num_step=32`
+* pure generation speed is about `0.70x` real-time
+* end-to-end shell timing overstates model cost if audio playback is not excluded
+
 ## Validation Commands
 
 Convert:
