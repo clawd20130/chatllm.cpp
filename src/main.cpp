@@ -1,4 +1,5 @@
 #include "chat.h"
+#include "JSON.h"
 #include <iomanip>
 #include <iostream>
 #include <fstream>
@@ -12,6 +13,7 @@
 #include <thread>
 #include <map>
 #include <filesystem>
+#include <cstdio>
 
 #include "vectorstore.h"
 #include "vision_process.h"
@@ -22,6 +24,12 @@
 #include <fcntl.h>
 #include <io.h>
 #include <windows.h>
+#endif
+
+#if defined(_WIN64)
+    #define POPEN_MODE_READ         "rb"
+#else
+    #define POPEN_MODE_READ         "r"
 #endif
 
 static chatllm::ThoughtChunkInterceptor thought_interceptor;
@@ -138,6 +146,123 @@ static std::string show_default_thought_tags(void)
     return tags;
 }
 
+static bool is_omnivoice_bridge_target(const std::string &model_path)
+{
+    const std::string lowered = utils::to_lower(model_path);
+    return (model_path == ":omnivoice")
+        || (lowered == "omnivoice://worker")
+        || (lowered == "omnivoice+worker://local");
+}
+
+static std::string get_env_value(const char *name)
+{
+    const char *value = std::getenv(name);
+    return value ? value : "";
+}
+
+static std::string shell_quote(const std::string &s)
+{
+#if defined(_WIN32)
+    std::string quoted = "\"";
+    for (char ch : s)
+    {
+        if (ch == '"')
+            quoted += "\\\"";
+        else
+            quoted.push_back(ch);
+    }
+    quoted.push_back('"');
+    return quoted;
+#else
+    std::string quoted = "'";
+    for (char ch : s)
+    {
+        if (ch == '\'')
+            quoted += "'\"'\"'";
+        else
+            quoted.push_back(ch);
+    }
+    quoted.push_back('\'');
+    return quoted;
+#endif
+}
+
+static std::filesystem::path try_resolve_omnivoice_bridge_script(const Args &args, const std::string &prog_path)
+{
+    const std::string explicit_path = utils::get_opt(args.additional, "omnivoice_bridge_script",
+                                                     get_env_value("CHATLLM_OMNIVOICE_BRIDGE_SCRIPT"));
+    std::vector<std::filesystem::path> candidates;
+    if (!explicit_path.empty())
+        candidates.push_back(explicit_path);
+
+    const auto cwd = std::filesystem::current_path();
+    candidates.push_back(cwd / "scripts" / "omnivoice_bridge.py");
+    candidates.push_back(cwd / ".." / "scripts" / "omnivoice_bridge.py");
+    candidates.push_back(cwd / ".." / ".." / "scripts" / "omnivoice_bridge.py");
+
+    if (!prog_path.empty())
+    {
+        const auto exe_dir = std::filesystem::absolute(prog_path).parent_path();
+        candidates.push_back(exe_dir / "scripts" / "omnivoice_bridge.py");
+        candidates.push_back(exe_dir / ".." / "scripts" / "omnivoice_bridge.py");
+        candidates.push_back(exe_dir / ".." / ".." / "scripts" / "omnivoice_bridge.py");
+    }
+
+    for (const auto &candidate : candidates)
+    {
+        std::error_code ec;
+        if (std::filesystem::exists(candidate, ec))
+            return std::filesystem::weakly_canonical(candidate, ec);
+    }
+
+    return {};
+}
+
+static std::filesystem::path resolve_omnivoice_bridge_script(const Args &args, const std::string &prog_path)
+{
+    auto path = try_resolve_omnivoice_bridge_script(args, prog_path);
+    CHATLLM_CHECK(!path.empty())
+        << "failed to locate scripts/omnivoice_bridge.py. "
+        << "Set CHATLLM_OMNIVOICE_BRIDGE_SCRIPT or --set omnivoice_bridge_script /abs/path/to/omnivoice_bridge.py";
+    return path;
+}
+
+static std::string resolve_omnivoice_python(const Args &args)
+{
+    auto value = utils::get_opt(args.additional, "omnivoice_python", get_env_value("CHATLLM_OMNIVOICE_PYTHON"));
+    if (!value.empty())
+        return value;
+#if defined(_WIN32)
+    return "python";
+#else
+    return "python3";
+#endif
+}
+
+static std::string resolve_omnivoice_worker_url(const Args &args)
+{
+    auto value = utils::get_opt(args.additional, "worker_url", "");
+    if (value.empty())
+        value = utils::get_opt(args.additional, "omnivoice_worker_url", "");
+    if (value.empty())
+        value = get_env_value("CHATLLM_OMNIVOICE_WORKER_URL");
+    if (value.empty())
+        value = "http://127.0.0.1:8021";
+    return value;
+}
+
+static int run_command_capture(const std::string &cmd, std::string &output)
+{
+    FILE *pipe = popen(cmd.c_str(), POPEN_MODE_READ);
+    CHATLLM_CHECK(nullptr != pipe) << "failed to run command: " << cmd;
+
+    char buffer[4096];
+    while (fgets(buffer, sizeof(buffer), pipe) != nullptr)
+        output += buffer;
+
+    return pclose(pipe);
+}
+
 void usage(const std::string &prog)
 {
     Args args;
@@ -145,7 +270,7 @@ void usage(const std::string &prog)
               << "\n"
               << "Basic options:\n"
               << "  -h, --help              show this help message and exit                                                         [*]\n"
-              << "  -m, --model PATH        model path\n"
+              << "  -m, --model PATH        model path. use `:omnivoice` to bridge TTS to a local OmniVoice worker-sdk service\n"
               << "  -p, --prompt PROMPT     prompt to start generation with (default: 你好)\n"
               << "      --prompt_file FN    prompt from file\n"
               << "  -s, --system SYSTEM     system prompt (instruction) (default: model specific)\n"
@@ -272,6 +397,9 @@ void usage(const std::string &prog)
               << "  --serve_rpc [H:]P[@id]  as a RPC server on host:port (optional: host default to 127.0.0.1, id defaults to 0)        [#]\n"
               << "  --ggml_dir DIR          specify directory of GGML\n"
               << "  --set KEY VALUE         set a pair of additional args.\n"
+              << "                          OmniVoice keys: language, instruct, ref_audio_file, ref_text, speed,\n"
+              << "                          duration, num_step, guidance_scale, t_shift, denoise, preprocess_prompt,\n"
+              << "                          postprocess_output. bridge-only keys: worker_url, timeout_seconds\n"
               << "Additional key-value args:\n"
               << "  --kv                    start of additional args. all following options are interpreted as k-v pairs\n"
               << "  key value               a key-value pair of args\n"
@@ -768,6 +896,155 @@ static void play_audio(const std::vector<int16_t> &data, const int sample_rate, 
         std::remove(fn.c_str());
     if (r != 0)
         streamer.cout << "FAILED to play audio. Please check ffplay is installed." << std::endl;
+}
+
+static void play_audio_file(const std::string &fn, TextStreamer &streamer, bool remove_after)
+{
+    std::string cmd = "ffplay -loglevel error -autoexit " + shell_quote(fn);
+    int r = system(cmd.c_str());
+    if (remove_after)
+        std::remove(fn.c_str());
+    if (r != 0)
+        streamer.cout << "FAILED to play audio. Please check ffplay is installed." << std::endl;
+}
+
+static void show_omnivoice_bridge_banner(TextStreamer &streamer, const Args &args)
+{
+    if (!args.show_banner)
+        return;
+
+    std::ostringstream oss;
+    oss     << "    ________          __  __    __    __  ___ \n"
+            << "   / ____/ /_  ____ _/ /_/ /   / /   /  |/  /_________  ____  \n"
+            << "  / /   / __ \\/ __ `/ __/ /   / /   / /|_/ // ___/ __ \\/ __ \\ \n"
+            << " / /___/ / / / /_/ / /_/ /___/ /___/ /  / // /__/ /_/ / /_/ / \n"
+            << " \\____/_/ /_/\\__,_/\\__/_____/_____/_/  /_(_)___/ .___/ .___/  \n"
+            << "OmniVoice bridge via worker-sdk               /_/   /_/       \n"
+            << "worker: " << resolve_omnivoice_worker_url(args) << "\n";
+    streamer.putln(oss.str());
+}
+
+static void emit_omnivoice_bridge_info(const Args &args, const std::string &prog_path)
+{
+    auto o = json::JSON::Make(json::JSON::Class::Object);
+    o["name"] = "OmniVoice bridge";
+    o["purpose"] = "TTS";
+    o["target"] = args.model_path;
+    o["worker_url"] = resolve_omnivoice_worker_url(args);
+    auto script = try_resolve_omnivoice_bridge_script(args, prog_path);
+    if (!script.empty())
+        o["script"] = script.string();
+    o["note"] = "Requires a running OmniVoice worker-sdk service.";
+    std::cout << o.dump() << std::endl;
+}
+
+static void validate_omnivoice_bridge_args(const Args &args)
+{
+    CHATLLM_CHECK(args.embedding_model_path.empty()) << ":omnivoice does not support embedding or RAG models";
+    CHATLLM_CHECK(args.reranker_model_path.empty())  << ":omnivoice does not support reranker models";
+    CHATLLM_CHECK(args.vector_store_in.empty())      << ":omnivoice does not support --init_vs";
+    CHATLLM_CHECK(args.merge_vs.empty())             << ":omnivoice does not support --merge_vs";
+    CHATLLM_CHECK(args.vector_stores.empty())        << ":omnivoice does not support --vector_store";
+    CHATLLM_CHECK(args.save_session.empty())         << ":omnivoice does not support --save_session";
+    CHATLLM_CHECK(args.load_session.empty())         << ":omnivoice does not support --load_session";
+    CHATLLM_CHECK(args.beam_size < 1)                << ":omnivoice does not support beam search";
+    CHATLLM_CHECK(args.test_fn.empty())              << ":omnivoice does not support --test";
+    CHATLLM_CHECK(!args.tokenize)                    << ":omnivoice does not support --tokenize";
+    CHATLLM_CHECK(args.system.empty())               << ":omnivoice does not support --system";
+    CHATLLM_CHECK(args.ai_prefix.empty())            << ":omnivoice does not support --ai_prefix";
+}
+
+static void write_omnivoice_request_file(const std::filesystem::path &fn,
+    const std::string &worker_url,
+    const std::string &prompt,
+    const std::string &tts_export,
+    const Args &args)
+{
+    auto o = json::JSON::Make(json::JSON::Class::Object);
+    o["worker_url"] = worker_url;
+    o["prompt"] = prompt;
+    o["tts_export"] = tts_export;
+    o["timeout_seconds"] = utils::get_opt(args.additional, "timeout_seconds", 300);
+
+    auto additional = json::JSON::Make(json::JSON::Class::Object);
+    for (const auto &it : args.additional)
+        additional[it.first] = it.second;
+    o["additional"] = additional;
+
+    std::ofstream file(fn, std::ios::binary);
+    CHATLLM_CHECK(file.is_open()) << "failed to create temporary request file: " << fn.string();
+    file << o.dump();
+}
+
+static void run_omnivoice_bridge_once(const std::string &prompt,
+    const std::string &export_fn,
+    const Args &args,
+    TextStreamer &streamer,
+    const std::string &prog_path)
+{
+    const auto script = resolve_omnivoice_bridge_script(args, prog_path);
+    const auto worker_url = resolve_omnivoice_worker_url(args);
+    const auto python = resolve_omnivoice_python(args);
+    const std::filesystem::path request_fn = utils::tmpname() + ".json";
+
+    write_omnivoice_request_file(request_fn, worker_url, prompt, export_fn, args);
+
+    const std::string cmd = shell_quote(python)
+        + " " + shell_quote(script.string())
+        + " --request_json " + shell_quote(request_fn.string())
+        + " 2>&1";
+
+    std::string output;
+    int rc = -1;
+    try
+    {
+        rc = run_command_capture(cmd, output);
+    }
+    catch (...)
+    {
+        std::error_code ec;
+        std::filesystem::remove(request_fn, ec);
+        throw;
+    }
+
+    std::error_code ec;
+    std::filesystem::remove(request_fn, ec);
+
+    CHATLLM_CHECK(rc == 0) << "OmniVoice bridge failed:\n" << output;
+    if (!output.empty() && (args.log_level <= 2))
+        streamer.cout << output << std::endl;
+}
+
+static void run_omnivoice_bridge(Args &args, TextStreamer &streamer, const std::string &prog_path)
+{
+    show_omnivoice_bridge_banner(streamer, args);
+
+    auto play_output = [&](const std::string &prompt)
+    {
+        const std::string export_fn = args.tts_export.size() > 0 ? args.tts_export : utils::tmpname() + ".wav";
+        run_omnivoice_bridge_once(prompt, export_fn, args, streamer, prog_path);
+        play_audio_file(export_fn, streamer, args.tts_export.empty());
+    };
+
+    if (!args.interactive)
+    {
+        play_output(args.prompt);
+        return;
+    }
+
+    while (1)
+    {
+        streamer.cout << "Input > " << std::flush;
+        std::string input;
+        if (!get_utf8_line(input, args.multi_line))
+        {
+            streamer.cout << "FAILED to read line." << std::endl;
+            break;
+        }
+        if (input.empty()) continue;
+        play_output(input);
+    }
+    streamer.cout << "Bye\n";
 }
 
 static void run_tts(Args &args, chatllm::Pipeline &pipeline, TextStreamer &streamer, const chatllm::GenerationConfig &gen_config)
@@ -1338,6 +1615,11 @@ int main(int argc, const char **argv)
 
     if (args.show)
     {
+        if (is_omnivoice_bridge_target(args.model_path))
+        {
+            emit_omnivoice_bridge_info(args, utf_args[0]);
+            return 0;
+        }
         chatllm::ModelLoader loader(args.model_path);
         std::cout << chatllm::ModelFactory::load_info(loader) << std::endl;
         return 0;
@@ -1366,6 +1648,13 @@ int main(int argc, const char **argv)
 
     try
     {
+        if (is_omnivoice_bridge_target(args.model_path))
+        {
+            validate_omnivoice_bridge_args(args);
+            run_omnivoice_bridge(args, streamer, utf_args[0]);
+            return 0;
+        }
+
         DEF_ExtraArgs(pipe_args, args);
 
         if (args.embedding_model_path.size() < 1)

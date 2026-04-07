@@ -255,6 +255,7 @@ class ModelType(Enum):
     GLM_ASR                 = 0x1000010D
     Qwen3_TTS               = 0x1000010E
     Qwen3_ASR               = 0x1000010F
+    OmniVoice               = 0x10000110
 
     LlaMAMulti    = 0x20000001
 
@@ -5942,6 +5943,90 @@ class Qwen3TTSConverter(BaseConverter):
             weight_names.append(n)
         return weight_names
 
+class OmniVoiceConverter(BaseConverter):
+    MODEL_TYPE = ModelType.OmniVoice
+    model_files = []
+
+    @staticmethod
+    def _get_llm_config(config):
+        llm_config = AttributeDict(copy.deepcopy(config.llm_config))
+        llm_config.tie_word_embeddings = bool(llm_config.tie_word_embeddings)
+        rope_parameters = llm_config.rope_parameters if "rope_parameters" in llm_config else None
+        if llm_config.rope_theta is None and rope_parameters is not None:
+            llm_config.rope_theta = rope_parameters["rope_theta"]
+        if llm_config.rope_scaling is None and rope_parameters is not None and rope_parameters["rope_type"] != "default":
+            llm_config.rope_scaling = dict(rope_parameters)
+            llm_config.rope_scaling["type"] = rope_parameters["rope_type"]
+        return llm_config
+
+    @staticmethod
+    def _rename_tensor_name(name: str) -> Optional[str]:
+        if name == "codebook_layer_offsets":
+            return None
+        if name.startswith("llm."):
+            return name.replace("llm.", "model.")
+        if name.startswith("audio_embeddings."):
+            return "omnivoice." + name
+        if name.startswith("audio_heads."):
+            return "omnivoice." + name
+        if name.startswith("acoustic_encoder."):
+            return "audio_tokenizer." + name
+        if name.startswith("acoustic_decoder."):
+            return "audio_tokenizer." + name
+        if name in ["fc.weight", "fc.bias", "fc2.weight", "fc2.bias"]:
+            return "audio_tokenizer." + name
+        if name.startswith("quantizer.quantizers."):
+            if ".project_in." in name or ".project_out." in name:
+                return "audio_tokenizer." + name
+            if name.endswith(".codebook.embed"):
+                return "audio_tokenizer." + name.replace(".codebook.embed", ".codebook.weight")
+        return None
+
+    @classmethod
+    def state_dict_pp(cls, config, state_dict):
+        llm_config = OmniVoiceConverter._get_llm_config(config)
+        r = {}
+        for name in state_dict:
+            tensor: torch.Tensor = state_dict[name]
+            renamed = OmniVoiceConverter._rename_tensor_name(name)
+            if renamed is None:
+                continue
+            if renamed.startswith("model."):
+                tensor = QWen3Converter.pp(llm_config, renamed, tensor)
+            elif renamed.startswith("audio_tokenizer.") and renamed.endswith(".alpha"):
+                if tensor.ndim == 3 and tensor.shape[0] == 1 and tensor.shape[2] == 1:
+                    tensor = tensor.reshape(tensor.shape[1])
+            r[renamed] = tensor
+        return r
+
+    @staticmethod
+    def dump_config(f, config, ggml_type):
+        llm_config = OmniVoiceConverter._get_llm_config(config)
+
+        old_has_lm_head = QWen3Converter.has_lm_head
+        try:
+            QWen3Converter.has_lm_head = False
+            QWen3Converter.dump_config(f, llm_config, ggml_type)
+        finally:
+            QWen3Converter.has_lm_head = old_has_lm_head
+
+        config_values = [
+            config.audio_vocab_size,
+            config.audio_mask_id,
+            config.num_audio_codebook,
+        ] + pad_to_len(config.audio_codebook_weights, 8)
+        f.write(struct.pack("<" + "i" * len(config_values), *config_values))
+
+    @staticmethod
+    def get_weight_names(config):
+        weight_names = []
+        for name in get_all_tensors(OmniVoiceConverter.model_files):
+            renamed = OmniVoiceConverter._rename_tensor_name(name)
+            if renamed is None:
+                continue
+            weight_names.append(renamed)
+        return sorted(weight_names)
+
 class Qwen3ASRConverter(BaseConverter):
     MODEL_TYPE = ModelType.Qwen3_ASR
 
@@ -9778,6 +9863,11 @@ def main():
         model_files += load_some_model(Qwen3TTSConverter.model_path / 'speech_tokenizer')
         Qwen3TTSConverter.model_files = model_files
         load_some_info(g_model_meta, Qwen3TTSConverter.model_path / 'speech_tokenizer', 'speech_tokenizer-')
+    elif arch in ['OmniVoice', 'omnivoice']:
+        OmniVoiceConverter.model_path = Path(args.model_name_or_path)
+        load_some_info(g_model_meta, OmniVoiceConverter.model_path / 'audio_tokenizer', 'audio_tokenizer-')
+        model_files += load_some_model(OmniVoiceConverter.model_path / 'audio_tokenizer')
+        OmniVoiceConverter.model_files = model_files
 
     #if args.lora_model_name_or_path is not None:
     #    from peft import PeftModel
@@ -10183,6 +10273,8 @@ def main():
         StepVLConverter.convert(config, model_files, vocab, ggml_type, args.save_path)
     elif arch == 'Qwen3TTSForConditionalGeneration':
         Qwen3TTSConverter.convert(config, model_files, vocab, ggml_type, args.save_path)
+    elif arch in ['OmniVoice', 'omnivoice']:
+        OmniVoiceConverter.convert(config, model_files, vocab, ggml_type, args.save_path)
     elif arch == 'YoutuForCausalLM':
         YoutuConverter.convert(config, model_files, vocab, ggml_type, args.save_path)
     elif arch == 'YoutuVLForConditionalGeneration':

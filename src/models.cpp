@@ -261,6 +261,7 @@ namespace chatllm
         case MODEL_TYPE_OUTE_TTS_QWEN3:
         case MODEL_TYPE_MAYA1:
         case MODEL_TYPE_QWEN3_TTS:
+        case MODEL_TYPE_OMNIVOICE:
             return ModelPurpose::TTS;
         case MODEL_TYPE_GLM_ASR:
         case MODEL_TYPE_QWEN3_ASR:
@@ -288,6 +289,7 @@ namespace chatllm
         case MODEL_TYPE_OUTE_TTS_QWEN3:
         case MODEL_TYPE_MAYA1:
         case MODEL_TYPE_QWEN3_TTS:
+        case MODEL_TYPE_OMNIVOICE:
             return ChatModelAccessPoint::Text | ChatModelAccessPoint::AudioOutput;
         case MODEL_TYPE_GLM_ASR:
         case MODEL_TYPE_QWEN3_ASR:
@@ -559,6 +561,8 @@ namespace chatllm
             return "Solar-Pro";
         case MODEL_TYPE_BAILINGMOE:
             return "Bailing";
+        case MODEL_TYPE_OMNIVOICE:
+            return "OmniVoice";
         default:
             return "???";
         }

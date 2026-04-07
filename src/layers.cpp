@@ -1781,7 +1781,6 @@ namespace chatllm
         else if (groups == 1)
         {
             int p = (kernel_size - 1) * (dilation + 1) / 2 - padding;
-            CHATLLM_CHECK(output_padding == 0) << "unsupported: output_padding = " << output_padding;
 
             ggml::tensor *fract_input = input;
             if (stride > 1)
@@ -1797,6 +1796,11 @@ namespace chatllm
                     ggml::element_size(input) * stride * ggml::get_dim(input, 0) * ggml::get_dim(input, 1),
                     0);
                 fract_input = ggml::cont(ctx, fract_input);
+            }
+
+            if (output_padding > 0)
+            {
+                fract_input = ggml::pad(ctx, fract_input, 0, output_padding);
             }
 
             auto view = ggml::permute(ctx, weight, 0, 2, 1, 3);

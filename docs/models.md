@@ -385,6 +385,85 @@ Please use `--format completion` for these models.
     * `ref_audio_file`: default "".
     * `ref_text`: default "". Required for "icl" mode.
 
+* OmniVoice (native)
+    * [x] Base: native OmniVoice TTS via converted `OmniVoice` checkpoints.
+    * [x] Auto voice and voice design.
+    * [x] Experimental voice cloning with `ref_audio_file` + `ref_text`.
+    * [x] [Development notes](./omnivoice.md).
+
+    Convert the original checkpoint first:
+
+    ```sh
+    /home/kevinzhow/github/omnivoice-worker-sdk/.venv/bin/python ./convert.py \
+      -i /path/to/OmniVoice \
+      -a OmniVoice \
+      -o /tmp/omnivoice-native.bin \
+      -n OmniVoice \
+      -t f16
+    ```
+
+    Then run native inference:
+
+    ```sh
+    ./build/bin/main -m /tmp/omnivoice-native.bin \
+      -p "This is native OmniVoice voice design." \
+      --tts_export /tmp/omnivoice-native.pcm \
+      --set language English \
+      --set instruct "female, low pitch"
+    ```
+
+    Native voice cloning:
+
+    ```sh
+    ./build/bin/main -m /tmp/omnivoice-native.bin \
+      -p "This sentence should reuse the reference voice." \
+      --tts_export /tmp/omnivoice-native-clone.pcm \
+      --set language English \
+      --set ref_audio_file /path/to/reference.wav \
+      --set ref_text "This is the reference transcript."
+    ```
+
+    Notes:
+    * `ref_text` is required when `ref_audio_file` is provided.
+    * The current native clone path runs the Higgs acoustic encoder and RVQ encode inside `chatllm.cpp`.
+    * The HuBERT semantic branch is not native yet, so clone quality is currently approximate compared with the Python reference runtime.
+
+* OmniVoice (worker bridge)
+    * [x] Local worker-sdk bridge: use `-m :omnivoice` to delegate TTS requests to a running OmniVoice worker.
+
+    This bridge keeps the existing `chatllm.cpp` TTS CLI flow. Example:
+
+    ```sh
+    ./build/bin/main -m :omnivoice \
+      -p "こんにちは。chatllm.cpp から OmniVoice を呼んでいます。" \
+      --tts_export /tmp/omnivoice.wav \
+      --set language Japanese \
+      --set instruct "female, low pitch"
+    ```
+
+    Voice cloning is also supported:
+
+    ```sh
+    ./build/bin/main -m :omnivoice \
+      -p "This is a cloned OmniVoice sample." \
+      --tts_export /tmp/omnivoice-clone.wav \
+      --set language English \
+      --set ref_audio_file /path/to/reference.wav \
+      --set ref_text "This is the reference transcript."
+    ```
+
+    Supported bridge keys (use `--set X Y`):
+    * `language`: default `auto`.
+    * `instruct`: voice design attributes such as `female, low pitch`.
+    * `ref_audio_file`: local reference audio path.
+    * `ref_text`: required when `ref_audio_file` is provided.
+    * `speed`, `duration`, `num_step`, `guidance_scale`, `t_shift`.
+    * `denoise`, `preprocess_prompt`, `postprocess_output`.
+    * `worker_url`: default `http://127.0.0.1:8021`.
+    * `timeout_seconds`: default `300`.
+
+    `scripts/omnivoice_bridge.py` calls `POST /worker-sdk/run` and writes a WAV file. Override the worker URL with `CHATLLM_OMNIVOICE_WORKER_URL` or `--set worker_url URL`.
+
 ## Multimodal Models
 
 * Fuyu (`FuyuForCausalLM`)

@@ -106,6 +106,7 @@ set(core_files src/backend.cpp
     models/moonshot.cpp
     models/neuralbeagle.cpp
     models/numinamath.cpp
+    models/omnivoice.cpp
     models/orpheus.cpp
     models/openchat.cpp
     models/orion.cpp

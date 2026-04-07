@@ -35,6 +35,7 @@ LittleAcademia[<a href="https://github.com/foldl/little-academia"   style="text-
 
 **What's New:**
 
+* 2026-04-08: [OmniVoice](./docs/omnivoice.md) native runtime, clone path, and local worker bridge
 * 2026-03-28: InternVL3.5
 * 2026-03-27: Qianfan-OCR
 * 2026-03-22: Penguin-VL
@@ -92,6 +93,33 @@ LittleAcademia[<a href="https://github.com/foldl/little-academia"   style="text-
 ## Quick Start
 
 As simple as `main_nim -i -m :model_id`. [Check it out](./docs/quick_start.md).
+
+For OmniVoice, use the bridge target `:omnivoice` with a running local worker-sdk service:
+
+```sh
+./build/bin/main -m :omnivoice \
+  -p "Hello from ChatLLM.cpp OmniVoice." \
+  --tts_export /tmp/omnivoice.wav \
+  --set language English \
+  --set instruct "female, low pitch"
+```
+
+Native OmniVoice is also available after conversion. See [OmniVoice Notes](./docs/omnivoice.md) for implementation details, current limits, and validation commands.
+
+```sh
+/home/kevinzhow/github/omnivoice-worker-sdk/.venv/bin/python ./convert.py \
+  -i /path/to/OmniVoice \
+  -a OmniVoice \
+  -o /tmp/omnivoice-native.bin \
+  -n OmniVoice \
+  -t f16
+
+./build/bin/main -m /tmp/omnivoice-native.bin \
+  -p "This is native OmniVoice." \
+  --tts_export /tmp/omnivoice-native.pcm \
+  --set language English \
+  --set instruct "female, low pitch"
+```
 
 ## Usage
 
