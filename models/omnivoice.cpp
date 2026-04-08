@@ -1249,6 +1249,75 @@ namespace chatllm::omnivoice
             double rms = -1.0;
         };
 
+        struct CFGGreedyCache
+        {
+            static constexpr int BATCH = 2;
+
+            explicit CFGGreedyCache(ConditionalGeneration *owner)
+                : owner(owner), ctx(&owner->backend_context)
+            {
+                ctx.gf = nullptr;
+            }
+
+            ~CFGGreedyCache()
+            {
+                reset();
+            }
+
+            void reset()
+            {
+                if (owner == nullptr)
+                    return;
+
+                owner->transformer->custom_embedding = nullptr;
+                for (auto *layer : masked_layers)
+                    layer->attention.mask = nullptr;
+                if (steps)
+                    steps->set_read_last_n(owner->ov_config.max_length);
+
+                set_dbg_ctx(nullptr);
+                ctx.reset();
+                ctx.gctx = GGMLContext();
+                ctx.gf = nullptr;
+
+                steps = nullptr;
+                masked_layers.clear();
+                text_ids_tensor = nullptr;
+                audio_ids_tensor = nullptr;
+                audio_mask_tensor = nullptr;
+                attention_mask_tensor = nullptr;
+                mask_bias_tensor = nullptr;
+                best_tokens_tensor = nullptr;
+                best_scores_tensor = nullptr;
+                initialized = false;
+            }
+
+            ConditionalGeneration *owner;
+            ForwardContext ctx;
+            LMFinalSteps *steps = nullptr;
+            bool initialized = false;
+            int target_len = 0;
+            int cond_seq_len = 0;
+            int uncond_seq_len = 0;
+            int seq_len = 0;
+            int target_offsets[BATCH] = { 0, 0 };
+            size_t target_audio_offsets[BATCH] = { 0, 0 };
+            size_t target_audio_bytes = 0;
+            std::vector<int> text_ids_padded[BATCH];
+            std::vector<int> audio_ids_padded[BATCH];
+            std::vector<float> audio_mask_padded[BATCH];
+            std::vector<uint16_t> attn_mask_f16;
+            std::vector<float> vocab_mask_bias;
+            std::vector<qwen::v3::QWen3Block *> masked_layers;
+            ggml::tensor *text_ids_tensor = nullptr;
+            ggml::tensor *audio_ids_tensor = nullptr;
+            ggml::tensor *audio_mask_tensor = nullptr;
+            ggml::tensor *attention_mask_tensor = nullptr;
+            ggml::tensor *mask_bias_tensor = nullptr;
+            ggml::tensor *best_tokens_tensor = nullptr;
+            ggml::tensor *best_scores_tensor = nullptr;
+        };
+
     public:
         ConditionalGeneration(const Config &config, const RuntimeConfig &runtime_config, ModelType type = MODEL_TYPE_OMNIVOICE)
             : Base(config, runtime_config, type, true, 2),
@@ -1355,13 +1424,14 @@ namespace chatllm::omnivoice
 
             std::mt19937 rng(gen_config.get_seed());
             const bool use_device_cfg_greedy = use_cfg && (options.class_temperature <= 0.0);
+            CFGGreedyCache cfg_greedy_cache(this);
             for (int step = 0; step < options.num_step; step++)
             {
                 std::fill(scores.begin(), scores.end(), -std::numeric_limits<double>::infinity());
                 if (use_device_cfg_greedy)
                 {
                     std::vector<float> best_scores;
-                    CHATLLM_CHECK(run_model_cfg_greedy(gen_config, cond, uncond, predicted, best_scores))
+                    CHATLLM_CHECK(run_model_cfg_greedy(gen_config, cond, uncond, cfg_greedy_cache, predicted, best_scores))
                         << "OmniVoice CFG greedy forward failed";
 
                     for (int pos = 0; pos < target_len; pos++)
@@ -1673,6 +1743,236 @@ namespace chatllm::omnivoice
             return ref;
         }
 
+        bool cfg_greedy_cache_matches(const SequenceInputs &cond_inputs, const SequenceInputs &uncond_inputs, const CFGGreedyCache &cache) const
+        {
+            return cache.initialized
+                && (cache.target_len == cond_inputs.target_len)
+                && (cache.cond_seq_len == (int)cond_inputs.text_ids.size())
+                && (cache.uncond_seq_len == (int)uncond_inputs.text_ids.size())
+                && (cache.seq_len == std::max(cache.cond_seq_len, cache.uncond_seq_len))
+                && (cache.target_offsets[0] == cond_inputs.target_offset)
+                && (cache.target_offsets[1] == uncond_inputs.target_offset);
+        }
+
+        void write_cfg_greedy_target_audio(const SequenceInputs &inputs, int batch_index, CFGGreedyCache &cache) const
+        {
+            CHATLLM_CHECK((batch_index >= 0) && (batch_index < CFGGreedyCache::BATCH));
+            CHATLLM_CHECK(inputs.target_len == cache.target_len) << "OmniVoice CFG target length changed after cache initialization";
+            CHATLLM_CHECK(inputs.target_offset == cache.target_offsets[batch_index]) << "OmniVoice CFG target offset changed after cache initialization";
+
+            const size_t target_values = (size_t)inputs.target_len * ov_config.num_audio_codebook;
+            const size_t source_offset = (size_t)inputs.target_offset * ov_config.num_audio_codebook;
+            auto &audio_ids = cache.audio_ids_padded[batch_index];
+
+            std::copy(inputs.audio_ids_shifted.begin() + source_offset,
+                inputs.audio_ids_shifted.begin() + source_offset + target_values,
+                audio_ids.begin() + source_offset);
+
+            Backend::write_tensor_data(cache.audio_ids_tensor,
+                audio_ids.data() + source_offset,
+                cache.target_audio_offsets[batch_index],
+                cache.target_audio_bytes);
+        }
+
+        bool init_cfg_greedy_cache(const GenerationConfig &gen_config, const SequenceInputs &cond_inputs, const SequenceInputs &uncond_inputs, CFGGreedyCache &cache)
+        {
+            cache.reset();
+
+            const int batch = CFGGreedyCache::BATCH;
+            const int target_len = cond_inputs.target_len;
+            const int cond_seq_len = (int)cond_inputs.text_ids.size();
+            const int uncond_seq_len = (int)uncond_inputs.text_ids.size();
+            const int seq_len = std::max(cond_seq_len, uncond_seq_len);
+
+            CHATLLM_CHECK(target_len > 0) << "OmniVoice target_len must be positive";
+            CHATLLM_CHECK(uncond_inputs.target_len == target_len) << "OmniVoice CFG target lengths must match";
+            CHATLLM_CHECK(uncond_seq_len == target_len) << "OmniVoice CFG uncond length must match target length";
+
+            Tokenizer *tok = dynamic_cast<Tokenizer *>(tokenizer);
+            CHATLLM_CHECK(tok != nullptr) << "OmniVoice tokenizer is not set";
+
+            cache.target_len = target_len;
+            cache.cond_seq_len = cond_seq_len;
+            cache.uncond_seq_len = uncond_seq_len;
+            cache.seq_len = seq_len;
+            cache.target_offsets[0] = cond_inputs.target_offset;
+            cache.target_offsets[1] = uncond_inputs.target_offset;
+            cache.target_audio_bytes = (size_t)target_len * ov_config.num_audio_codebook * sizeof(int);
+            cache.vocab_mask_bias.assign(ov_config.audio_vocab_size, 0.0f);
+            cache.vocab_mask_bias[ov_config.audio_mask_id] = -1e30f;
+
+            std::vector<float> attn_mask((size_t)seq_len * seq_len * batch, -INFINITY);
+            const SequenceInputs *inputs[batch] = { &cond_inputs, &uncond_inputs };
+            const int seq_lens[batch] = { cond_seq_len, uncond_seq_len };
+            const int pad_token = tok->pad_token_id >= 0 ? tok->pad_token_id : 0;
+
+            for (int i = 0; i < batch; i++)
+            {
+                cache.text_ids_padded[i].assign(seq_len, pad_token);
+                std::copy(inputs[i]->text_ids.begin(), inputs[i]->text_ids.end(), cache.text_ids_padded[i].begin());
+
+                cache.audio_ids_padded[i].assign(seq_len * ov_config.num_audio_codebook, ov_config.audio_mask_id);
+                for (int pos = 0; pos < seq_len; pos++)
+                {
+                    for (int codebook = 0; codebook < ov_config.num_audio_codebook; codebook++)
+                    {
+                        cache.audio_ids_padded[i][pos * ov_config.num_audio_codebook + codebook] =
+                            codebook * ov_config.audio_vocab_size + ov_config.audio_mask_id;
+                    }
+                }
+                std::copy(inputs[i]->audio_ids_shifted.begin(), inputs[i]->audio_ids_shifted.end(), cache.audio_ids_padded[i].begin());
+
+                cache.audio_mask_padded[i].assign(seq_len, 0.0f);
+                std::copy(inputs[i]->audio_mask.begin(), inputs[i]->audio_mask.end(), cache.audio_mask_padded[i].begin());
+
+                for (int q = 0; q < seq_lens[i]; q++)
+                {
+                    for (int k = 0; k < seq_lens[i]; k++)
+                    {
+                        attn_mask[(size_t)i * seq_len * seq_len + (size_t)q * seq_len + k] = 0.0f;
+                    }
+                }
+            }
+            cache.attn_mask_f16.resize(attn_mask.size());
+            ggml::from_float(GGML_TYPE_F16, attn_mask.data(), cache.attn_mask_f16.data(), 1, attn_mask.size());
+
+            cache.target_audio_offsets[0] = (size_t)cache.target_offsets[0] * ov_config.num_audio_codebook * sizeof(int);
+            cache.target_audio_offsets[1] = ((size_t)seq_len + (size_t)cache.target_offsets[1]) * ov_config.num_audio_codebook * sizeof(int);
+
+            cache.ctx.user_options = w_ctx_.user_options;
+            cache.ctx.gctx = GGMLContext({.mem_size = backend_context.buf_compute_meta.size(), .mem_buffer = backend_context.buf_compute_meta.data(), .no_alloc = true});
+            cache.ctx.gf = ggml::new_graph_custom(&cache.ctx, GRAPH_SIZE, false);
+
+            transformer->reserve_batch_size(batch);
+            set_dbg_ctx(&cache.ctx);
+            transformer->set_ctx(seq_len);
+            cache.steps = dynamic_cast<LMFinalSteps *>(transformer->get_final_steps());
+            if (cache.steps)
+                cache.steps->set_read_last_n(seq_len);
+
+            cache.ctx.move_to_layer(LayerAllocatorManager::MiscLayer::Prolog);
+            cache.text_ids_tensor = ggml::new_tensor_2d(&cache.ctx, GGML_TYPE_I32, seq_len, batch);
+            cache.audio_ids_tensor = ggml::new_tensor_3d(&cache.ctx, GGML_TYPE_I32, ov_config.num_audio_codebook, seq_len, batch);
+            cache.audio_mask_tensor = ggml::new_tensor_3d(&cache.ctx, GGML_TYPE_F32, 1, seq_len, batch);
+            cache.attention_mask_tensor = ggml::new_tensor_3d(&cache.ctx, GGML_TYPE_F16, seq_len, seq_len, batch);
+            cache.mask_bias_tensor = ggml::new_tensor_1d(&cache.ctx, GGML_TYPE_F32, ov_config.audio_vocab_size);
+            ggml::set_input(cache.text_ids_tensor);
+            ggml::set_input(cache.audio_ids_tensor);
+            ggml::set_input(cache.audio_mask_tensor);
+            ggml::set_input(cache.attention_mask_tensor);
+            ggml::set_input(cache.mask_bias_tensor);
+
+            const auto custom_embedding = [this, &cache, seq_len, batch](ComputeContext *ctx, ggml::tensor *input)
+            {
+                ggml::tensor *text_emb = transformer->word_embeddings->forward(ctx, input);
+                text_emb = ggml::reshape_3d(ctx, text_emb, ov_config.hidden_size, seq_len, batch);
+
+                ggml::tensor *audio_emb = audio_embeddings.forward(ctx, cache.audio_ids_tensor);
+                audio_emb = ggml::sum(ctx, audio_emb, 1);
+                audio_emb = ggml::reshape_3d(ctx, audio_emb, ov_config.hidden_size, seq_len, batch);
+
+                ggml::tensor *mask = ggml::repeat(ctx, cache.audio_mask_tensor, audio_emb);
+                ggml::tensor *delta = ggml::sub(ctx, audio_emb, text_emb);
+                delta = ggml::mul(ctx, delta, mask);
+                return ggml::add(ctx, text_emb, delta);
+            };
+
+            cache.masked_layers.reserve(ov_config.num_hidden_layers);
+            for (int i = 0; i < ov_config.num_hidden_layers; i++)
+            {
+                auto *layer = dynamic_cast<qwen::v3::QWen3Block *>(transformer->get_layer(i));
+                CHATLLM_CHECK(layer != nullptr) << "failed to access OmniVoice Qwen3 block";
+                cache.masked_layers.push_back(layer);
+                layer->attention.mask = cache.attention_mask_tensor;
+            }
+
+            transformer->custom_embedding = custom_embedding;
+            transformer->forward(&cache.ctx, cache.text_ids_tensor, 0);
+
+            cache.ctx.move_to_layer(LayerAllocatorManager::MiscLayer::Epilog);
+            ggml::tensor *hidden_states = transformer->last_hidden_state;
+            CHATLLM_CHECK(hidden_states != nullptr) << "OmniVoice hidden states are unavailable";
+
+            ggml::tensor *cond_hidden = ggml::view_2d(&cache.ctx, hidden_states, ov_config.hidden_size, target_len,
+                ggml::row_size(hidden_states),
+                (cond_seq_len - target_len) * ggml::row_size(hidden_states));
+            ggml::tensor *uncond_hidden = ggml::view_2d(&cache.ctx, hidden_states, ov_config.hidden_size, target_len,
+                ggml::row_size(hidden_states),
+                seq_len * ggml::row_size(hidden_states));
+
+            ggml::tensor *cond_logits = audio_heads.forward(&cache.ctx, cond_hidden);
+            cond_logits = ggml::reshape_3d(&cache.ctx, cond_logits, ov_config.audio_vocab_size, ov_config.num_audio_codebook, target_len);
+            ggml::tensor *uncond_logits = audio_heads.forward(&cache.ctx, uncond_hidden);
+            uncond_logits = ggml::reshape_3d(&cache.ctx, uncond_logits, ov_config.audio_vocab_size, ov_config.num_audio_codebook, target_len);
+
+            ggml::tensor *cond_log_probs = ggml::log(&cache.ctx, ggml::soft_max(&cache.ctx, cond_logits));
+            ggml::tensor *uncond_log_probs = ggml::log(&cache.ctx, ggml::soft_max(&cache.ctx, uncond_logits));
+            ggml::tensor *combined = ggml::sub(&cache.ctx, cond_log_probs, uncond_log_probs);
+            combined = ggml::scale(&cache.ctx, combined, (float)options.guidance_scale);
+            combined = ggml::add(&cache.ctx, combined, cond_log_probs);
+            combined = ggml::add(&cache.ctx, combined, ggml::repeat(&cache.ctx, cache.mask_bias_tensor, combined));
+            ggml::tensor *combined_log_probs = ggml::log(&cache.ctx, ggml::soft_max(&cache.ctx, combined));
+
+            cache.best_tokens_tensor = ggml::top_k(&cache.ctx, combined_log_probs, 1);
+            if (ggml::type_of(cache.best_tokens_tensor) != GGML_TYPE_I32)
+            {
+                ggml::tensor *t = ggml::new_tensor_like(&cache.ctx, GGML_TYPE_I32, cache.best_tokens_tensor);
+                cache.best_tokens_tensor = ggml::cpy(&cache.ctx, cache.best_tokens_tensor, t);
+            }
+            cache.best_tokens_tensor = ggml::reshape_2d(&cache.ctx, ggml::cont(&cache.ctx, cache.best_tokens_tensor), ov_config.num_audio_codebook, target_len);
+
+            cache.best_scores_tensor = ggml::get_rows(&cache.ctx,
+                ggml::reshape_4d(&cache.ctx, combined_log_probs, 1, ov_config.audio_vocab_size, ov_config.num_audio_codebook, target_len),
+                ggml::reshape_3d(&cache.ctx, cache.best_tokens_tensor, 1, ov_config.num_audio_codebook, target_len));
+            cache.best_scores_tensor = ggml::reshape_2d(&cache.ctx, ggml::cont(&cache.ctx, cache.best_scores_tensor), ov_config.num_audio_codebook, target_len);
+
+            if (ggml::type_of(cache.best_scores_tensor) != GGML_TYPE_F32)
+            {
+                ggml::tensor *t = ggml::new_tensor_like(&cache.ctx, GGML_TYPE_F32, cache.best_scores_tensor);
+                cache.best_scores_tensor = ggml::cpy(&cache.ctx, cache.best_scores_tensor, t);
+            }
+
+            ggml::set_output(cache.best_tokens_tensor);
+            ggml::build_forward_expand(&cache.ctx, cache.best_tokens_tensor);
+            ggml::set_output(cache.best_scores_tensor);
+            ggml::build_forward_expand(&cache.ctx, cache.best_scores_tensor);
+
+            if (!cache.ctx.allocate())
+            {
+                cache.reset();
+                return false;
+            }
+
+            int64_t text_offset = 0;
+            int64_t audio_offset = 0;
+            int64_t mask_offset = 0;
+            for (int i = 0; i < batch; i++)
+            {
+                Backend::write_tensor_data(cache.text_ids_tensor, cache.text_ids_padded[i].data(), text_offset,
+                    cache.text_ids_padded[i].size() * sizeof(cache.text_ids_padded[i][0]));
+                Backend::write_tensor_data(cache.audio_ids_tensor, cache.audio_ids_padded[i].data(), audio_offset,
+                    cache.audio_ids_padded[i].size() * sizeof(cache.audio_ids_padded[i][0]));
+                Backend::write_tensor_data(cache.audio_mask_tensor, cache.audio_mask_padded[i].data(), mask_offset,
+                    cache.audio_mask_padded[i].size() * sizeof(cache.audio_mask_padded[i][0]));
+                text_offset += cache.text_ids_padded[i].size() * sizeof(cache.text_ids_padded[i][0]);
+                audio_offset += cache.audio_ids_padded[i].size() * sizeof(cache.audio_ids_padded[i][0]);
+                mask_offset += cache.audio_mask_padded[i].size() * sizeof(cache.audio_mask_padded[i][0]);
+            }
+            Backend::write_tensor_data(cache.attention_mask_tensor, cache.attn_mask_f16.data());
+            Backend::write_tensor_data(cache.mask_bias_tensor, cache.vocab_mask_bias.data(), 0,
+                cache.vocab_mask_bias.size() * sizeof(cache.vocab_mask_bias[0]));
+
+            if (gen_config.dump_dot.size() > 0)
+            {
+                backend_context.dump_graph(cache.ctx.get_cgraph(), gen_config.dump_dot.c_str());
+                exit(-1);
+            }
+
+            cache.initialized = true;
+            set_dbg_ctx(nullptr);
+            return true;
+        }
+
         bool run_model_logits(const GenerationConfig &gen_config, const SequenceInputs &inputs, std::vector<float> &output)
         {
             const int seq_len = (int)inputs.text_ids.size();
@@ -1761,206 +2061,24 @@ namespace chatllm::omnivoice
         }
 
         bool run_model_cfg_greedy(const GenerationConfig &gen_config, const SequenceInputs &cond_inputs, const SequenceInputs &uncond_inputs,
-            std::vector<int> &predicted_tokens, std::vector<float> &predicted_scores)
+            CFGGreedyCache &cache, std::vector<int> &predicted_tokens, std::vector<float> &predicted_scores)
         {
-            const int batch = 2;
-            const int target_len = cond_inputs.target_len;
-            const int cond_seq_len = (int)cond_inputs.text_ids.size();
-            const int uncond_seq_len = (int)uncond_inputs.text_ids.size();
-            const int seq_len = std::max(cond_seq_len, uncond_seq_len);
-
-            CHATLLM_CHECK(target_len > 0) << "OmniVoice target_len must be positive";
-            CHATLLM_CHECK(uncond_inputs.target_len == target_len) << "OmniVoice CFG target lengths must match";
-            CHATLLM_CHECK(uncond_seq_len == target_len) << "OmniVoice CFG uncond length must match target length";
-
-            Tokenizer *tok = dynamic_cast<Tokenizer *>(tokenizer);
-            CHATLLM_CHECK(tok != nullptr) << "OmniVoice tokenizer is not set";
-
-            std::vector<int> text_ids_padded[batch];
-            std::vector<int> audio_ids_padded[batch];
-            std::vector<float> audio_mask_padded[batch];
-            std::vector<float> attn_mask((size_t)seq_len * seq_len * batch, -INFINITY);
-            std::vector<float> vocab_mask_bias(ov_config.audio_vocab_size, 0.0f);
-            vocab_mask_bias[ov_config.audio_mask_id] = -1e30f;
-
-            const SequenceInputs *inputs[batch] = { &cond_inputs, &uncond_inputs };
-            const int seq_lens[batch] = { cond_seq_len, uncond_seq_len };
-            const int pad_token = tok->pad_token_id >= 0 ? tok->pad_token_id : 0;
-            for (int i = 0; i < batch; i++)
+            if (!cfg_greedy_cache_matches(cond_inputs, uncond_inputs, cache))
             {
-                text_ids_padded[i].assign(seq_len, pad_token);
-                std::copy(inputs[i]->text_ids.begin(), inputs[i]->text_ids.end(), text_ids_padded[i].begin());
-
-                audio_ids_padded[i].assign(seq_len * ov_config.num_audio_codebook, ov_config.audio_mask_id);
-                for (int pos = 0; pos < seq_len; pos++)
-                {
-                    for (int codebook = 0; codebook < ov_config.num_audio_codebook; codebook++)
-                    {
-                        audio_ids_padded[i][pos * ov_config.num_audio_codebook + codebook] =
-                            codebook * ov_config.audio_vocab_size + ov_config.audio_mask_id;
-                    }
-                }
-                std::copy(inputs[i]->audio_ids_shifted.begin(), inputs[i]->audio_ids_shifted.end(), audio_ids_padded[i].begin());
-
-                audio_mask_padded[i].assign(seq_len, 0.0f);
-                std::copy(inputs[i]->audio_mask.begin(), inputs[i]->audio_mask.end(), audio_mask_padded[i].begin());
-
-                for (int q = 0; q < seq_lens[i]; q++)
-                {
-                    for (int k = 0; k < seq_lens[i]; k++)
-                    {
-                        attn_mask[(size_t)i * seq_len * seq_len + (size_t)q * seq_len + k] = 0.0f;
-                    }
-                }
+                if (!init_cfg_greedy_cache(gen_config, cond_inputs, uncond_inputs, cache))
+                    return false;
             }
 
-            ForwardContext ctx(&backend_context);
-            ctx.user_options = w_ctx_.user_options;
-            ctx.gctx = GGMLContext({.mem_size = backend_context.buf_compute_meta.size(), .mem_buffer = backend_context.buf_compute_meta.data(), .no_alloc = true});
-            ctx.gf = ggml::new_graph_custom(&ctx, GRAPH_SIZE, false);
+            write_cfg_greedy_target_audio(cond_inputs, 0, cache);
+            write_cfg_greedy_target_audio(uncond_inputs, 1, cache);
 
-            transformer->reserve_batch_size(batch);
-            set_dbg_ctx(&ctx);
-            transformer->set_ctx(seq_len);
-            LMFinalSteps *steps = dynamic_cast<LMFinalSteps *>(transformer->get_final_steps());
-            if (steps)
-                steps->set_read_last_n(seq_len);
+            predicted_tokens.resize((size_t)cache.target_len * ov_config.num_audio_codebook);
+            predicted_scores.resize((size_t)cache.target_len * ov_config.num_audio_codebook);
 
-            ctx.move_to_layer(LayerAllocatorManager::MiscLayer::Prolog);
-            ggml::tensor *text_ids_tensor = ggml::new_tensor_2d(&ctx, GGML_TYPE_I32, seq_len, batch);
-            ggml::tensor *audio_ids_tensor = ggml::new_tensor_3d(&ctx, GGML_TYPE_I32, ov_config.num_audio_codebook, seq_len, batch);
-            ggml::tensor *audio_mask_tensor = ggml::new_tensor_3d(&ctx, GGML_TYPE_F32, 1, seq_len, batch);
-            ggml::tensor *attention_mask_tensor = ggml::new_tensor_3d(&ctx, GGML_TYPE_F16, seq_len, seq_len, batch);
-            ggml::tensor *mask_bias_tensor = ggml::new_tensor_1d(&ctx, GGML_TYPE_F32, ov_config.audio_vocab_size);
-            ggml::set_input(attention_mask_tensor);
-            ggml::set_input(mask_bias_tensor);
-
-            const auto custom_embedding = [this, audio_ids_tensor, audio_mask_tensor, seq_len, batch](ComputeContext *ctx, ggml::tensor *input)
-            {
-                ggml::tensor *text_emb = transformer->word_embeddings->forward(ctx, input);
-                text_emb = ggml::reshape_3d(ctx, text_emb, ov_config.hidden_size, seq_len, batch);
-
-                ggml::tensor *audio_emb = audio_embeddings.forward(ctx, audio_ids_tensor);
-                audio_emb = ggml::sum(ctx, audio_emb, 1);
-                audio_emb = ggml::reshape_3d(ctx, audio_emb, ov_config.hidden_size, seq_len, batch);
-
-                ggml::tensor *mask = ggml::repeat(ctx, audio_mask_tensor, audio_emb);
-                ggml::tensor *delta = ggml::sub(ctx, audio_emb, text_emb);
-                delta = ggml::mul(ctx, delta, mask);
-                return ggml::add(ctx, text_emb, delta);
-            };
-
-            std::vector<qwen::v3::QWen3Block *> masked_layers;
-            masked_layers.reserve(ov_config.num_hidden_layers);
-            for (int i = 0; i < ov_config.num_hidden_layers; i++)
-            {
-                auto *layer = dynamic_cast<qwen::v3::QWen3Block *>(transformer->get_layer(i));
-                CHATLLM_CHECK(layer != nullptr) << "failed to access OmniVoice Qwen3 block";
-                masked_layers.push_back(layer);
-                layer->attention.mask = attention_mask_tensor;
-            }
-
-            transformer->custom_embedding = custom_embedding;
-            transformer->forward(&ctx, text_ids_tensor, 0);
-
-            ctx.move_to_layer(LayerAllocatorManager::MiscLayer::Epilog);
-            ggml::tensor *hidden_states = transformer->last_hidden_state;
-            CHATLLM_CHECK(hidden_states != nullptr) << "OmniVoice hidden states are unavailable";
-
-            ggml::tensor *cond_hidden = ggml::view_2d(&ctx, hidden_states, ov_config.hidden_size, target_len,
-                ggml::row_size(hidden_states),
-                (cond_seq_len - target_len) * ggml::row_size(hidden_states));
-            ggml::tensor *uncond_hidden = ggml::view_2d(&ctx, hidden_states, ov_config.hidden_size, target_len,
-                ggml::row_size(hidden_states),
-                seq_len * ggml::row_size(hidden_states));
-
-            ggml::tensor *cond_logits = audio_heads.forward(&ctx, cond_hidden);
-            cond_logits = ggml::reshape_3d(&ctx, cond_logits, ov_config.audio_vocab_size, ov_config.num_audio_codebook, target_len);
-            ggml::tensor *uncond_logits = audio_heads.forward(&ctx, uncond_hidden);
-            uncond_logits = ggml::reshape_3d(&ctx, uncond_logits, ov_config.audio_vocab_size, ov_config.num_audio_codebook, target_len);
-
-            ggml::tensor *cond_log_probs = ggml::log(&ctx, ggml::soft_max(&ctx, cond_logits));
-            ggml::tensor *uncond_log_probs = ggml::log(&ctx, ggml::soft_max(&ctx, uncond_logits));
-            ggml::tensor *combined = ggml::sub(&ctx, cond_log_probs, uncond_log_probs);
-            combined = ggml::scale(&ctx, combined, (float)options.guidance_scale);
-            combined = ggml::add(&ctx, combined, cond_log_probs);
-            combined = ggml::add(&ctx, combined, ggml::repeat(&ctx, mask_bias_tensor, combined));
-            ggml::tensor *combined_log_probs = ggml::log(&ctx, ggml::soft_max(&ctx, combined));
-
-            ggml::tensor *best_tokens = ggml::top_k(&ctx, combined_log_probs, 1);
-            if (ggml::type_of(best_tokens) != GGML_TYPE_I32)
-            {
-                ggml::tensor *t = ggml::new_tensor_like(&ctx, GGML_TYPE_I32, best_tokens);
-                best_tokens = ggml::cpy(&ctx, best_tokens, t);
-            }
-            best_tokens = ggml::reshape_2d(&ctx, ggml::cont(&ctx, best_tokens), ov_config.num_audio_codebook, target_len);
-
-            ggml::tensor *best_scores = ggml::get_rows(&ctx,
-                ggml::reshape_4d(&ctx, combined_log_probs, 1, ov_config.audio_vocab_size, ov_config.num_audio_codebook, target_len),
-                ggml::reshape_3d(&ctx, best_tokens, 1, ov_config.num_audio_codebook, target_len));
-            best_scores = ggml::reshape_2d(&ctx, ggml::cont(&ctx, best_scores), ov_config.num_audio_codebook, target_len);
-
-            if (ggml::type_of(best_scores) != GGML_TYPE_F32)
-            {
-                ggml::tensor *t = ggml::new_tensor_like(&ctx, GGML_TYPE_F32, best_scores);
-                best_scores = ggml::cpy(&ctx, best_scores, t);
-            }
-
-            ggml::set_output(best_tokens);
-            ggml::build_forward_expand(&ctx, best_tokens);
-            ggml::set_output(best_scores);
-            ggml::build_forward_expand(&ctx, best_scores);
-
-            predicted_tokens.resize((size_t)target_len * ov_config.num_audio_codebook);
-            predicted_scores.resize((size_t)target_len * ov_config.num_audio_codebook);
-
-            if (!ctx.allocate())
-            {
-                set_dbg_ctx(nullptr);
-                transformer->custom_embedding = nullptr;
-                for (auto *layer : masked_layers)
-                    layer->attention.mask = nullptr;
-                if (steps)
-                    steps->set_read_last_n(ov_config.max_length);
-                return false;
-            }
-
-            int64_t text_offset = 0;
-            int64_t audio_offset = 0;
-            int64_t mask_offset = 0;
-            for (int i = 0; i < batch; i++)
-            {
-                Backend::write_tensor_data(text_ids_tensor, text_ids_padded[i].data(), text_offset, text_ids_padded[i].size() * sizeof(text_ids_padded[i][0]));
-                Backend::write_tensor_data(audio_ids_tensor, audio_ids_padded[i].data(), audio_offset, audio_ids_padded[i].size() * sizeof(audio_ids_padded[i][0]));
-                Backend::write_tensor_data(audio_mask_tensor, audio_mask_padded[i].data(), mask_offset, audio_mask_padded[i].size() * sizeof(audio_mask_padded[i][0]));
-                text_offset += text_ids_padded[i].size() * sizeof(text_ids_padded[i][0]);
-                audio_offset += audio_ids_padded[i].size() * sizeof(audio_ids_padded[i][0]);
-                mask_offset += audio_mask_padded[i].size() * sizeof(audio_mask_padded[i][0]);
-            }
-
-            std::vector<uint16_t> attn_mask_f16(attn_mask.size());
-            ggml::from_float(ggml::type_of(attention_mask_tensor), attn_mask.data(), attn_mask_f16.data(), 1, attn_mask.size());
-            Backend::write_tensor_data(attention_mask_tensor, attn_mask_f16.data());
-            Backend::write_tensor_data(mask_bias_tensor, vocab_mask_bias.data(), 0, vocab_mask_bias.size() * sizeof(vocab_mask_bias[0]));
-
-            if (gen_config.dump_dot.size() > 0)
-            {
-                backend_context.dump_graph(ctx.get_cgraph(), gen_config.dump_dot.c_str());
-                exit(-1);
-            }
-
-            transformer->before_eval(&ctx);
-            ctx.compute();
-            Backend::read_tensor_data(best_tokens, predicted_tokens.data());
-            Backend::read_tensor_data(best_scores, predicted_scores.data());
-
-            transformer->custom_embedding = nullptr;
-            for (auto *layer : masked_layers)
-                layer->attention.mask = nullptr;
-            if (steps)
-                steps->set_read_last_n(ov_config.max_length);
-            set_dbg_ctx(nullptr);
-            ctx.reset();
+            transformer->before_eval(&cache.ctx);
+            cache.ctx.compute();
+            Backend::read_tensor_data(cache.best_tokens_tensor, predicted_tokens.data());
+            Backend::read_tensor_data(cache.best_scores_tensor, predicted_scores.data());
             return true;
         }
 

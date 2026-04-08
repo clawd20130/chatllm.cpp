@@ -167,6 +167,14 @@ Key lesson from this round:
 * batching CFG conditional and unconditional branches only helped after the graph also kept CFG combine, masking, `top_k(1)`, and confidence extraction on-device
 * the earlier batched experiment that still read back full logits regressed wall time on this 780M Vulkan path and was not kept
 * the version that returns only top-1 token ids and confidence scores from the graph did survive and is now the default greedy CFG hot path
+* a later graph/buffer reuse pass for the same greedy CFG path helped, but the gain was smaller than the on-device CFG move itself
+* for this repo, the most reliable comparison harness was a resident interactive process driven through a pseudo-TTY with the exact same prompt, prompt count, and `--no_play` settings on both revisions
+* that same-harness A/B comparison showed:
+  * baseline `617eb27`: `9.45s` average for `8.6s` audio, or `RTF ~= 1.10`
+  * graph/buffer reuse plus static input caching: `9.30s` average for `8.6s` audio, or `RTF ~= 1.08`
+  * improvement: about `1.6%`
+* absolute resident timings from different harnesses are not directly comparable; the pseudo-TTY harness is slightly slower than the earlier local interactive measurement, but it was used here because it gave repeatable same-machine A/B numbers
+* a follow-up experiment that wrote target audio ids directly from the live `SequenceInputs` buffers and removed `ggml::set_input()` from `text_ids` / `audio_ids` / `audio_mask` regressed back to about `RTF ~= 1.10` and was discarded
 
 ## Validation Commands
 
