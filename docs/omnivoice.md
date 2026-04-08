@@ -148,18 +148,25 @@ Observed numbers:
   * setup: one resident interactive process, `2` warmup runs, then `5` measured runs
   * average: `10.98s` wall time for `8.6s` audio, or `RTF ~= 1.28`
   * stable tail (`runs 3-5`): `11.05s` wall time for `8.6s` audio, or `RTF ~= 1.28`
+* current stable pure generation timing after moving the default greedy CFG hot path back onto the graph:
+  * setup: one resident interactive process, `2` warmup runs, then `5` measured runs
+  * average: `8.90s` wall time for `8.6s` audio, or `RTF ~= 1.03`
+  * stable tail (`runs 3-5`): `8.90s` wall time for `8.6s` audio, or `RTF ~= 1.04`
+* current one-shot `--no_play` CLI timing with process startup included: about `14.29s` wall time for `8.6s` audio, or `RTF ~= 1.66`
 
 Interpretation:
 
 * on this 780M Vulkan path, native OmniVoice auto TTS is not yet real-time at `num_step=32`
-* stable pure generation speed is now about `0.78x` real-time
-* relative to the previous `RTF ~= 1.43` baseline, the current stable path is about `10.8%` faster
+* stable pure generation speed is now about `0.97x` real-time, very close to real-time
+* relative to the previous `RTF ~= 1.28` stable path, the current device-side CFG greedy path is about `18.9%` faster
+* relative to the older `RTF ~= 1.43` baseline, the current stable path is about `27.6%` faster
 * end-to-end shell timing overstates model cost if audio playback is not excluded
 
-One optimization experiment did not survive:
+Key lesson from this round:
 
-* batching CFG conditional and unconditional branches with per-batch attention masks matched the Python reference structure
-* on this current Vulkan 780M path, that version regressed wall time, so it was not kept as the default runtime path
+* batching CFG conditional and unconditional branches only helped after the graph also kept CFG combine, masking, `top_k(1)`, and confidence extraction on-device
+* the earlier batched experiment that still read back full logits regressed wall time on this 780M Vulkan path and was not kept
+* the version that returns only top-1 token ids and confidence scores from the graph did survive and is now the default greedy CFG hot path
 
 ## Validation Commands
 

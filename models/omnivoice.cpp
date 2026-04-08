@@ -1354,118 +1354,143 @@ namespace chatllm::omnivoice
             }
 
             std::mt19937 rng(gen_config.get_seed());
+            const bool use_device_cfg_greedy = use_cfg && (options.class_temperature <= 0.0);
             for (int step = 0; step < options.num_step; step++)
             {
-                std::vector<float> cond_logits;
-                std::vector<float> uncond_logits;
-                if (use_cfg)
+                std::fill(scores.begin(), scores.end(), -std::numeric_limits<double>::infinity());
+                if (use_device_cfg_greedy)
                 {
-                    CHATLLM_CHECK(run_model_logits(gen_config, cond, cond_logits)) << "OmniVoice conditional forward failed";
-                    CHATLLM_CHECK(run_model_logits(gen_config, uncond, uncond_logits)) << "OmniVoice unconditional forward failed";
+                    std::vector<float> best_scores;
+                    CHATLLM_CHECK(run_model_cfg_greedy(gen_config, cond, uncond, predicted, best_scores))
+                        << "OmniVoice CFG greedy forward failed";
+
+                    for (int pos = 0; pos < target_len; pos++)
+                    {
+                        for (int codebook = 0; codebook < ov_config.num_audio_codebook; codebook++)
+                        {
+                            const int flat_idx = pos * ov_config.num_audio_codebook + codebook;
+                            if (tokens[flat_idx] != ov_config.audio_mask_id)
+                                continue;
+
+                            double score = (double)best_scores[flat_idx] - ((double)codebook * options.layer_penalty_factor);
+                            if (options.position_temperature > 0.0)
+                                score = score / options.position_temperature + detail::sample_gumbel(rng);
+                            scores[flat_idx] = score;
+                        }
+                    }
                 }
                 else
                 {
-                    CHATLLM_CHECK(run_model_logits(gen_config, cond, cond_logits)) << "OmniVoice conditional forward failed";
-                }
-
-                std::fill(scores.begin(), scores.end(), -std::numeric_limits<double>::infinity());
-                std::vector<double> cond_log_probs;
-                std::vector<double> uncond_log_probs;
-                std::vector<double> combined_log_probs;
-                std::vector<float> tmp_combined_logits;
-                std::vector<int> top_order;
-
-                for (int pos = 0; pos < target_len; pos++)
-                {
-                    for (int codebook = 0; codebook < ov_config.num_audio_codebook; codebook++)
+                    std::vector<float> cond_logits;
+                    std::vector<float> uncond_logits;
+                    if (use_cfg)
                     {
-                        const int flat_idx = pos * ov_config.num_audio_codebook + codebook;
-                        if (tokens[flat_idx] != ov_config.audio_mask_id)
-                            continue;
+                        CHATLLM_CHECK(run_model_logits(gen_config, cond, cond_logits)) << "OmniVoice conditional forward failed";
+                        CHATLLM_CHECK(run_model_logits(gen_config, uncond, uncond_logits)) << "OmniVoice unconditional forward failed";
+                    }
+                    else
+                    {
+                        CHATLLM_CHECK(run_model_logits(gen_config, cond, cond_logits)) << "OmniVoice conditional forward failed";
+                    }
 
-                        const float *cond_ptr = &cond_logits[ov_config.audio_vocab_size * (codebook + ov_config.num_audio_codebook * pos)];
-                        const float *uncond_ptr = use_cfg ? &uncond_logits[ov_config.audio_vocab_size * (codebook + ov_config.num_audio_codebook * pos)] : nullptr;
+                    std::vector<double> cond_log_probs;
+                    std::vector<double> uncond_log_probs;
+                    std::vector<double> combined_log_probs;
+                    std::vector<float> tmp_combined_logits;
+                    std::vector<int> top_order;
 
-                        int best_token = 0;
-                        double best_score = -std::numeric_limits<double>::infinity();
-
-                        if (options.class_temperature <= 0.0)
+                    for (int pos = 0; pos < target_len; pos++)
+                    {
+                        for (int codebook = 0; codebook < ov_config.num_audio_codebook; codebook++)
                         {
-                            const double cond_log_z = detail::logsumexp(cond_ptr, ov_config.audio_vocab_size);
-                            const double uncond_log_z = use_cfg ? detail::logsumexp(uncond_ptr, ov_config.audio_vocab_size) : 0.0;
-                            double combined_log_z_max = -std::numeric_limits<double>::infinity();
-                            double combined_log_z_sum = 0.0;
-                            double best_raw_score = -std::numeric_limits<double>::infinity();
+                            const int flat_idx = pos * ov_config.num_audio_codebook + codebook;
+                            if (tokens[flat_idx] != ov_config.audio_mask_id)
+                                continue;
 
-                            for (int v = 0; v < ov_config.audio_vocab_size; v++)
+                            const float *cond_ptr = &cond_logits[ov_config.audio_vocab_size * (codebook + ov_config.num_audio_codebook * pos)];
+                            const float *uncond_ptr = use_cfg ? &uncond_logits[ov_config.audio_vocab_size * (codebook + ov_config.num_audio_codebook * pos)] : nullptr;
+
+                            int best_token = 0;
+                            double best_score = -std::numeric_limits<double>::infinity();
+
+                            if (options.class_temperature <= 0.0)
                             {
-                                if (v == ov_config.audio_mask_id)
-                                    continue;
+                                const double cond_log_z = detail::logsumexp(cond_ptr, ov_config.audio_vocab_size);
+                                const double uncond_log_z = use_cfg ? detail::logsumexp(uncond_ptr, ov_config.audio_vocab_size) : 0.0;
+                                double combined_log_z_max = -std::numeric_limits<double>::infinity();
+                                double combined_log_z_sum = 0.0;
+                                double best_raw_score = -std::numeric_limits<double>::infinity();
 
-                                const double cond_log_prob = (double)cond_ptr[v] - cond_log_z;
-                                double combined_raw = cond_log_prob;
-                                if (use_cfg)
-                                {
-                                    const double uncond_log_prob = (double)uncond_ptr[v] - uncond_log_z;
-                                    combined_raw += options.guidance_scale * (cond_log_prob - uncond_log_prob);
-                                }
-
-                                if (combined_raw > best_raw_score)
-                                {
-                                    best_raw_score = combined_raw;
-                                    best_token = v;
-                                }
-                                detail::logsumexp_update(combined_raw, combined_log_z_max, combined_log_z_sum);
-                            }
-
-                            const double combined_log_z = combined_log_z_max + std::log(combined_log_z_sum);
-                            best_score = best_raw_score - combined_log_z;
-                        }
-                        else
-                        {
-                            if (use_cfg)
-                            {
-                                detail::log_softmax(cond_ptr, ov_config.audio_vocab_size, cond_log_probs);
-                                detail::log_softmax(uncond_ptr, ov_config.audio_vocab_size, uncond_log_probs);
-                                combined_log_probs.resize(ov_config.audio_vocab_size);
-                                tmp_combined_logits.resize(ov_config.audio_vocab_size);
                                 for (int v = 0; v < ov_config.audio_vocab_size; v++)
                                 {
-                                    combined_log_probs[v] = cond_log_probs[v] + options.guidance_scale * (cond_log_probs[v] - uncond_log_probs[v]);
-                                    tmp_combined_logits[v] = (float)combined_log_probs[v];
+                                    if (v == ov_config.audio_mask_id)
+                                        continue;
+
+                                    const double cond_log_prob = (double)cond_ptr[v] - cond_log_z;
+                                    double combined_raw = cond_log_prob;
+                                    if (use_cfg)
+                                    {
+                                        const double uncond_log_prob = (double)uncond_ptr[v] - uncond_log_z;
+                                        combined_raw += options.guidance_scale * (cond_log_prob - uncond_log_prob);
+                                    }
+
+                                    if (combined_raw > best_raw_score)
+                                    {
+                                        best_raw_score = combined_raw;
+                                        best_token = v;
+                                    }
+                                    detail::logsumexp_update(combined_raw, combined_log_z_max, combined_log_z_sum);
                                 }
-                                detail::log_softmax(tmp_combined_logits.data(), ov_config.audio_vocab_size, combined_log_probs);
+
+                                const double combined_log_z = combined_log_z_max + std::log(combined_log_z_sum);
+                                best_score = best_raw_score - combined_log_z;
                             }
                             else
                             {
-                                detail::log_softmax(cond_ptr, ov_config.audio_vocab_size, combined_log_probs);
-                            }
-
-                            combined_log_probs[ov_config.audio_mask_id] = -std::numeric_limits<double>::infinity();
-
-                            int top_k = std::max(1, (int)std::ceil(ov_config.audio_vocab_size * 0.1));
-                            top_order.resize(ov_config.audio_vocab_size);
-                            std::iota(top_order.begin(), top_order.end(), 0);
-                            std::partial_sort(top_order.begin(), top_order.begin() + top_k, top_order.end(),
-                                [&](int a, int b) { return combined_log_probs[a] > combined_log_probs[b]; });
-                            for (int i = 0; i < top_k; i++)
-                            {
-                                int token_id = top_order[i];
-                                double sampled = combined_log_probs[token_id] / options.class_temperature + detail::sample_gumbel(rng);
-                                if (sampled > best_score)
+                                if (use_cfg)
                                 {
-                                    best_score = sampled;
-                                    best_token = token_id;
+                                    detail::log_softmax(cond_ptr, ov_config.audio_vocab_size, cond_log_probs);
+                                    detail::log_softmax(uncond_ptr, ov_config.audio_vocab_size, uncond_log_probs);
+                                    combined_log_probs.resize(ov_config.audio_vocab_size);
+                                    tmp_combined_logits.resize(ov_config.audio_vocab_size);
+                                    for (int v = 0; v < ov_config.audio_vocab_size; v++)
+                                    {
+                                        combined_log_probs[v] = cond_log_probs[v] + options.guidance_scale * (cond_log_probs[v] - uncond_log_probs[v]);
+                                        tmp_combined_logits[v] = (float)combined_log_probs[v];
+                                    }
+                                    detail::log_softmax(tmp_combined_logits.data(), ov_config.audio_vocab_size, combined_log_probs);
                                 }
-                            }
-                            best_score = combined_log_probs[best_token];
-                        }
+                                else
+                                {
+                                    detail::log_softmax(cond_ptr, ov_config.audio_vocab_size, combined_log_probs);
+                                }
 
-                        predicted[flat_idx] = best_token;
-                        double score = best_score - ((double)codebook * options.layer_penalty_factor);
-                        if (options.position_temperature > 0.0)
-                            score = score / options.position_temperature + detail::sample_gumbel(rng);
-                        scores[flat_idx] = score;
+                                combined_log_probs[ov_config.audio_mask_id] = -std::numeric_limits<double>::infinity();
+
+                                int top_k = std::max(1, (int)std::ceil(ov_config.audio_vocab_size * 0.1));
+                                top_order.resize(ov_config.audio_vocab_size);
+                                std::iota(top_order.begin(), top_order.end(), 0);
+                                std::partial_sort(top_order.begin(), top_order.begin() + top_k, top_order.end(),
+                                    [&](int a, int b) { return combined_log_probs[a] > combined_log_probs[b]; });
+                                for (int i = 0; i < top_k; i++)
+                                {
+                                    int token_id = top_order[i];
+                                    double sampled = combined_log_probs[token_id] / options.class_temperature + detail::sample_gumbel(rng);
+                                    if (sampled > best_score)
+                                    {
+                                        best_score = sampled;
+                                        best_token = token_id;
+                                    }
+                                }
+                                best_score = combined_log_probs[best_token];
+                            }
+
+                            predicted[flat_idx] = best_token;
+                            double score = best_score - ((double)codebook * options.layer_penalty_factor);
+                            if (options.position_temperature > 0.0)
+                                score = score / options.position_temperature + detail::sample_gumbel(rng);
+                            scores[flat_idx] = score;
+                        }
                     }
                 }
 
@@ -1480,8 +1505,11 @@ namespace chatllm::omnivoice
 
                 std::vector<int> order(scores.size());
                 std::iota(order.begin(), order.end(), 0);
-                std::partial_sort(order.begin(), order.begin() + reveal, order.end(),
-                    [&](int a, int b) { return scores[a] > scores[b]; });
+                if (reveal < (int)order.size())
+                {
+                    std::nth_element(order.begin(), order.begin() + reveal, order.end(),
+                        [&](int a, int b) { return scores[a] > scores[b]; });
+                }
 
                 for (int i = 0; i < reveal; i++)
                 {
@@ -1725,6 +1753,210 @@ namespace chatllm::omnivoice
             Backend::read_tensor_data(r, output.data());
 
             transformer->custom_embedding = nullptr;
+            if (steps)
+                steps->set_read_last_n(ov_config.max_length);
+            set_dbg_ctx(nullptr);
+            ctx.reset();
+            return true;
+        }
+
+        bool run_model_cfg_greedy(const GenerationConfig &gen_config, const SequenceInputs &cond_inputs, const SequenceInputs &uncond_inputs,
+            std::vector<int> &predicted_tokens, std::vector<float> &predicted_scores)
+        {
+            const int batch = 2;
+            const int target_len = cond_inputs.target_len;
+            const int cond_seq_len = (int)cond_inputs.text_ids.size();
+            const int uncond_seq_len = (int)uncond_inputs.text_ids.size();
+            const int seq_len = std::max(cond_seq_len, uncond_seq_len);
+
+            CHATLLM_CHECK(target_len > 0) << "OmniVoice target_len must be positive";
+            CHATLLM_CHECK(uncond_inputs.target_len == target_len) << "OmniVoice CFG target lengths must match";
+            CHATLLM_CHECK(uncond_seq_len == target_len) << "OmniVoice CFG uncond length must match target length";
+
+            Tokenizer *tok = dynamic_cast<Tokenizer *>(tokenizer);
+            CHATLLM_CHECK(tok != nullptr) << "OmniVoice tokenizer is not set";
+
+            std::vector<int> text_ids_padded[batch];
+            std::vector<int> audio_ids_padded[batch];
+            std::vector<float> audio_mask_padded[batch];
+            std::vector<float> attn_mask((size_t)seq_len * seq_len * batch, -INFINITY);
+            std::vector<float> vocab_mask_bias(ov_config.audio_vocab_size, 0.0f);
+            vocab_mask_bias[ov_config.audio_mask_id] = -1e30f;
+
+            const SequenceInputs *inputs[batch] = { &cond_inputs, &uncond_inputs };
+            const int seq_lens[batch] = { cond_seq_len, uncond_seq_len };
+            const int pad_token = tok->pad_token_id >= 0 ? tok->pad_token_id : 0;
+            for (int i = 0; i < batch; i++)
+            {
+                text_ids_padded[i].assign(seq_len, pad_token);
+                std::copy(inputs[i]->text_ids.begin(), inputs[i]->text_ids.end(), text_ids_padded[i].begin());
+
+                audio_ids_padded[i].assign(seq_len * ov_config.num_audio_codebook, ov_config.audio_mask_id);
+                for (int pos = 0; pos < seq_len; pos++)
+                {
+                    for (int codebook = 0; codebook < ov_config.num_audio_codebook; codebook++)
+                    {
+                        audio_ids_padded[i][pos * ov_config.num_audio_codebook + codebook] =
+                            codebook * ov_config.audio_vocab_size + ov_config.audio_mask_id;
+                    }
+                }
+                std::copy(inputs[i]->audio_ids_shifted.begin(), inputs[i]->audio_ids_shifted.end(), audio_ids_padded[i].begin());
+
+                audio_mask_padded[i].assign(seq_len, 0.0f);
+                std::copy(inputs[i]->audio_mask.begin(), inputs[i]->audio_mask.end(), audio_mask_padded[i].begin());
+
+                for (int q = 0; q < seq_lens[i]; q++)
+                {
+                    for (int k = 0; k < seq_lens[i]; k++)
+                    {
+                        attn_mask[(size_t)i * seq_len * seq_len + (size_t)q * seq_len + k] = 0.0f;
+                    }
+                }
+            }
+
+            ForwardContext ctx(&backend_context);
+            ctx.user_options = w_ctx_.user_options;
+            ctx.gctx = GGMLContext({.mem_size = backend_context.buf_compute_meta.size(), .mem_buffer = backend_context.buf_compute_meta.data(), .no_alloc = true});
+            ctx.gf = ggml::new_graph_custom(&ctx, GRAPH_SIZE, false);
+
+            transformer->reserve_batch_size(batch);
+            set_dbg_ctx(&ctx);
+            transformer->set_ctx(seq_len);
+            LMFinalSteps *steps = dynamic_cast<LMFinalSteps *>(transformer->get_final_steps());
+            if (steps)
+                steps->set_read_last_n(seq_len);
+
+            ctx.move_to_layer(LayerAllocatorManager::MiscLayer::Prolog);
+            ggml::tensor *text_ids_tensor = ggml::new_tensor_2d(&ctx, GGML_TYPE_I32, seq_len, batch);
+            ggml::tensor *audio_ids_tensor = ggml::new_tensor_3d(&ctx, GGML_TYPE_I32, ov_config.num_audio_codebook, seq_len, batch);
+            ggml::tensor *audio_mask_tensor = ggml::new_tensor_3d(&ctx, GGML_TYPE_F32, 1, seq_len, batch);
+            ggml::tensor *attention_mask_tensor = ggml::new_tensor_3d(&ctx, GGML_TYPE_F16, seq_len, seq_len, batch);
+            ggml::tensor *mask_bias_tensor = ggml::new_tensor_1d(&ctx, GGML_TYPE_F32, ov_config.audio_vocab_size);
+            ggml::set_input(attention_mask_tensor);
+            ggml::set_input(mask_bias_tensor);
+
+            const auto custom_embedding = [this, audio_ids_tensor, audio_mask_tensor, seq_len, batch](ComputeContext *ctx, ggml::tensor *input)
+            {
+                ggml::tensor *text_emb = transformer->word_embeddings->forward(ctx, input);
+                text_emb = ggml::reshape_3d(ctx, text_emb, ov_config.hidden_size, seq_len, batch);
+
+                ggml::tensor *audio_emb = audio_embeddings.forward(ctx, audio_ids_tensor);
+                audio_emb = ggml::sum(ctx, audio_emb, 1);
+                audio_emb = ggml::reshape_3d(ctx, audio_emb, ov_config.hidden_size, seq_len, batch);
+
+                ggml::tensor *mask = ggml::repeat(ctx, audio_mask_tensor, audio_emb);
+                ggml::tensor *delta = ggml::sub(ctx, audio_emb, text_emb);
+                delta = ggml::mul(ctx, delta, mask);
+                return ggml::add(ctx, text_emb, delta);
+            };
+
+            std::vector<qwen::v3::QWen3Block *> masked_layers;
+            masked_layers.reserve(ov_config.num_hidden_layers);
+            for (int i = 0; i < ov_config.num_hidden_layers; i++)
+            {
+                auto *layer = dynamic_cast<qwen::v3::QWen3Block *>(transformer->get_layer(i));
+                CHATLLM_CHECK(layer != nullptr) << "failed to access OmniVoice Qwen3 block";
+                masked_layers.push_back(layer);
+                layer->attention.mask = attention_mask_tensor;
+            }
+
+            transformer->custom_embedding = custom_embedding;
+            transformer->forward(&ctx, text_ids_tensor, 0);
+
+            ctx.move_to_layer(LayerAllocatorManager::MiscLayer::Epilog);
+            ggml::tensor *hidden_states = transformer->last_hidden_state;
+            CHATLLM_CHECK(hidden_states != nullptr) << "OmniVoice hidden states are unavailable";
+
+            ggml::tensor *cond_hidden = ggml::view_2d(&ctx, hidden_states, ov_config.hidden_size, target_len,
+                ggml::row_size(hidden_states),
+                (cond_seq_len - target_len) * ggml::row_size(hidden_states));
+            ggml::tensor *uncond_hidden = ggml::view_2d(&ctx, hidden_states, ov_config.hidden_size, target_len,
+                ggml::row_size(hidden_states),
+                seq_len * ggml::row_size(hidden_states));
+
+            ggml::tensor *cond_logits = audio_heads.forward(&ctx, cond_hidden);
+            cond_logits = ggml::reshape_3d(&ctx, cond_logits, ov_config.audio_vocab_size, ov_config.num_audio_codebook, target_len);
+            ggml::tensor *uncond_logits = audio_heads.forward(&ctx, uncond_hidden);
+            uncond_logits = ggml::reshape_3d(&ctx, uncond_logits, ov_config.audio_vocab_size, ov_config.num_audio_codebook, target_len);
+
+            ggml::tensor *cond_log_probs = ggml::log(&ctx, ggml::soft_max(&ctx, cond_logits));
+            ggml::tensor *uncond_log_probs = ggml::log(&ctx, ggml::soft_max(&ctx, uncond_logits));
+            ggml::tensor *combined = ggml::sub(&ctx, cond_log_probs, uncond_log_probs);
+            combined = ggml::scale(&ctx, combined, (float)options.guidance_scale);
+            combined = ggml::add(&ctx, combined, cond_log_probs);
+            combined = ggml::add(&ctx, combined, ggml::repeat(&ctx, mask_bias_tensor, combined));
+            ggml::tensor *combined_log_probs = ggml::log(&ctx, ggml::soft_max(&ctx, combined));
+
+            ggml::tensor *best_tokens = ggml::top_k(&ctx, combined_log_probs, 1);
+            if (ggml::type_of(best_tokens) != GGML_TYPE_I32)
+            {
+                ggml::tensor *t = ggml::new_tensor_like(&ctx, GGML_TYPE_I32, best_tokens);
+                best_tokens = ggml::cpy(&ctx, best_tokens, t);
+            }
+            best_tokens = ggml::reshape_2d(&ctx, ggml::cont(&ctx, best_tokens), ov_config.num_audio_codebook, target_len);
+
+            ggml::tensor *best_scores = ggml::get_rows(&ctx,
+                ggml::reshape_4d(&ctx, combined_log_probs, 1, ov_config.audio_vocab_size, ov_config.num_audio_codebook, target_len),
+                ggml::reshape_3d(&ctx, best_tokens, 1, ov_config.num_audio_codebook, target_len));
+            best_scores = ggml::reshape_2d(&ctx, ggml::cont(&ctx, best_scores), ov_config.num_audio_codebook, target_len);
+
+            if (ggml::type_of(best_scores) != GGML_TYPE_F32)
+            {
+                ggml::tensor *t = ggml::new_tensor_like(&ctx, GGML_TYPE_F32, best_scores);
+                best_scores = ggml::cpy(&ctx, best_scores, t);
+            }
+
+            ggml::set_output(best_tokens);
+            ggml::build_forward_expand(&ctx, best_tokens);
+            ggml::set_output(best_scores);
+            ggml::build_forward_expand(&ctx, best_scores);
+
+            predicted_tokens.resize((size_t)target_len * ov_config.num_audio_codebook);
+            predicted_scores.resize((size_t)target_len * ov_config.num_audio_codebook);
+
+            if (!ctx.allocate())
+            {
+                set_dbg_ctx(nullptr);
+                transformer->custom_embedding = nullptr;
+                for (auto *layer : masked_layers)
+                    layer->attention.mask = nullptr;
+                if (steps)
+                    steps->set_read_last_n(ov_config.max_length);
+                return false;
+            }
+
+            int64_t text_offset = 0;
+            int64_t audio_offset = 0;
+            int64_t mask_offset = 0;
+            for (int i = 0; i < batch; i++)
+            {
+                Backend::write_tensor_data(text_ids_tensor, text_ids_padded[i].data(), text_offset, text_ids_padded[i].size() * sizeof(text_ids_padded[i][0]));
+                Backend::write_tensor_data(audio_ids_tensor, audio_ids_padded[i].data(), audio_offset, audio_ids_padded[i].size() * sizeof(audio_ids_padded[i][0]));
+                Backend::write_tensor_data(audio_mask_tensor, audio_mask_padded[i].data(), mask_offset, audio_mask_padded[i].size() * sizeof(audio_mask_padded[i][0]));
+                text_offset += text_ids_padded[i].size() * sizeof(text_ids_padded[i][0]);
+                audio_offset += audio_ids_padded[i].size() * sizeof(audio_ids_padded[i][0]);
+                mask_offset += audio_mask_padded[i].size() * sizeof(audio_mask_padded[i][0]);
+            }
+
+            std::vector<uint16_t> attn_mask_f16(attn_mask.size());
+            ggml::from_float(ggml::type_of(attention_mask_tensor), attn_mask.data(), attn_mask_f16.data(), 1, attn_mask.size());
+            Backend::write_tensor_data(attention_mask_tensor, attn_mask_f16.data());
+            Backend::write_tensor_data(mask_bias_tensor, vocab_mask_bias.data(), 0, vocab_mask_bias.size() * sizeof(vocab_mask_bias[0]));
+
+            if (gen_config.dump_dot.size() > 0)
+            {
+                backend_context.dump_graph(ctx.get_cgraph(), gen_config.dump_dot.c_str());
+                exit(-1);
+            }
+
+            transformer->before_eval(&ctx);
+            ctx.compute();
+            Backend::read_tensor_data(best_tokens, predicted_tokens.data());
+            Backend::read_tensor_data(best_scores, predicted_scores.data());
+
+            transformer->custom_embedding = nullptr;
+            for (auto *layer : masked_layers)
+                layer->attention.mask = nullptr;
             if (steps)
                 steps->set_read_last_n(ov_config.max_length);
             set_dbg_ctx(nullptr);
