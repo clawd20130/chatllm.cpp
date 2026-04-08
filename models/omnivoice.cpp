@@ -271,6 +271,41 @@ namespace chatllm::omnivoice
                 out[i] = std::log(out[i]) - log_sum;
         }
 
+        static double logsumexp(const float *logits, int vocab_size)
+        {
+            double max_v = -std::numeric_limits<double>::infinity();
+            for (int i = 0; i < vocab_size; i++)
+                max_v = std::max(max_v, (double)logits[i]);
+
+            double sum = 0.0;
+            for (int i = 0; i < vocab_size; i++)
+                sum += std::exp((double)logits[i] - max_v);
+            return max_v + std::log(sum);
+        }
+
+        static void logsumexp_update(double value, double &max_v, double &sum_exp)
+        {
+            if (!std::isfinite(value))
+                return;
+
+            if (!std::isfinite(max_v))
+            {
+                max_v = value;
+                sum_exp = 1.0;
+                return;
+            }
+
+            if (value > max_v)
+            {
+                sum_exp = sum_exp * std::exp(max_v - value) + 1.0;
+                max_v = value;
+            }
+            else
+            {
+                sum_exp += std::exp(value - max_v);
+            }
+        }
+
         static std::string replace_newlines_with_periods(const std::string &text)
         {
             std::string out;
@@ -447,6 +482,12 @@ namespace chatllm::omnivoice
             BaseTokenizer::encode(style, ids);
         }
 
+        void encode(const std::string &text, std::vector<int> &ids) const override
+        {
+            last_prompt_text = text;
+            qwen::v3::Tokenizer::encode(text, ids);
+        }
+
         void wrap_text_tokens(const std::vector<int> &input_ids, std::vector<int> &ids) const
         {
             ids.clear();
@@ -461,6 +502,7 @@ namespace chatllm::omnivoice
         std::string instruct = "";
         std::string ref_text = "";
         std::string ref_audio_file = "";
+        mutable std::string last_prompt_text = "";
         int denoise_token_id = -1;
         int lang_start_token_id = -1;
         int lang_end_token_id = -1;
@@ -1279,16 +1321,19 @@ namespace chatllm::omnivoice
             sample_rate = audio_tokenizer.get_sample_rate();
             channels = 1;
 
-            const std::string prompt_text = tok->decode(input_ids);
+            const std::string prompt_text = tok->last_prompt_text.empty() ? tok->decode(input_ids) : tok->last_prompt_text;
             const ReferenceConditioning ref = prepare_reference_conditioning(gen_config, *tok);
             const bool has_ref_audio = !ref.audio_tokens.empty();
             const int ref_audio_frames = has_ref_audio ? (int)(ref.audio_tokens.size() / ov_config.num_audio_codebook) : 0;
             int target_len = options.duration > 0.0 ?
                 std::max(1, (int)std::round(options.duration * audio_tokenizer.get_frame_rate())) :
                 detail::estimate_target_tokens(prompt_text, options.speed, ref.text, ref_audio_frames);
+            const bool use_cfg = options.guidance_scale != 0.0;
 
             SequenceInputs cond = build_cond_inputs(prompt_text, ref, target_len, *tok);
-            SequenceInputs uncond = build_uncond_inputs(target_len);
+            SequenceInputs uncond;
+            if (use_cfg)
+                uncond = build_uncond_inputs(target_len);
 
             const int total_tokens = ov_config.num_audio_codebook * target_len;
             std::vector<int> tokens(total_tokens, ov_config.audio_mask_id);
@@ -1309,15 +1354,26 @@ namespace chatllm::omnivoice
             }
 
             std::mt19937 rng(gen_config.get_seed());
-
             for (int step = 0; step < options.num_step; step++)
             {
                 std::vector<float> cond_logits;
                 std::vector<float> uncond_logits;
-                CHATLLM_CHECK(run_model_logits(gen_config, cond, cond_logits)) << "OmniVoice conditional forward failed";
-                CHATLLM_CHECK(run_model_logits(gen_config, uncond, uncond_logits)) << "OmniVoice unconditional forward failed";
+                if (use_cfg)
+                {
+                    CHATLLM_CHECK(run_model_logits(gen_config, cond, cond_logits)) << "OmniVoice conditional forward failed";
+                    CHATLLM_CHECK(run_model_logits(gen_config, uncond, uncond_logits)) << "OmniVoice unconditional forward failed";
+                }
+                else
+                {
+                    CHATLLM_CHECK(run_model_logits(gen_config, cond, cond_logits)) << "OmniVoice conditional forward failed";
+                }
 
                 std::fill(scores.begin(), scores.end(), -std::numeric_limits<double>::infinity());
+                std::vector<double> cond_log_probs;
+                std::vector<double> uncond_log_probs;
+                std::vector<double> combined_log_probs;
+                std::vector<float> tmp_combined_logits;
+                std::vector<int> top_order;
 
                 for (int pos = 0; pos < target_len; pos++)
                 {
@@ -1327,44 +1383,74 @@ namespace chatllm::omnivoice
                         if (tokens[flat_idx] != ov_config.audio_mask_id)
                             continue;
 
-                        const float *cond_ptr = &cond_logits[ov_config.audio_vocab_size * (codebook + ov_config.num_audio_codebook * (cond.target_offset + pos))];
-                        const float *uncond_ptr = &uncond_logits[ov_config.audio_vocab_size * (codebook + ov_config.num_audio_codebook * pos)];
-
-                        std::vector<double> cond_log_probs;
-                        std::vector<double> uncond_log_probs;
-                        std::vector<double> combined_log_probs;
-                        if (options.guidance_scale != 0.0)
-                        {
-                            detail::log_softmax(cond_ptr, ov_config.audio_vocab_size, cond_log_probs);
-                            detail::log_softmax(uncond_ptr, ov_config.audio_vocab_size, uncond_log_probs);
-                            combined_log_probs.resize(ov_config.audio_vocab_size);
-                            for (int v = 0; v < ov_config.audio_vocab_size; v++)
-                                combined_log_probs[v] = cond_log_probs[v] + options.guidance_scale * (cond_log_probs[v] - uncond_log_probs[v]);
-
-                            std::vector<float> tmp(ov_config.audio_vocab_size);
-                            for (int v = 0; v < ov_config.audio_vocab_size; v++)
-                                tmp[v] = (float)combined_log_probs[v];
-                            detail::log_softmax(tmp.data(), ov_config.audio_vocab_size, combined_log_probs);
-                        }
-                        else
-                        {
-                            detail::log_softmax(cond_ptr, ov_config.audio_vocab_size, combined_log_probs);
-                        }
-
-                        combined_log_probs[ov_config.audio_mask_id] = -std::numeric_limits<double>::infinity();
+                        const float *cond_ptr = &cond_logits[ov_config.audio_vocab_size * (codebook + ov_config.num_audio_codebook * pos)];
+                        const float *uncond_ptr = use_cfg ? &uncond_logits[ov_config.audio_vocab_size * (codebook + ov_config.num_audio_codebook * pos)] : nullptr;
 
                         int best_token = 0;
                         double best_score = -std::numeric_limits<double>::infinity();
-                        if (options.class_temperature > 0.0)
+
+                        if (options.class_temperature <= 0.0)
                         {
+                            const double cond_log_z = detail::logsumexp(cond_ptr, ov_config.audio_vocab_size);
+                            const double uncond_log_z = use_cfg ? detail::logsumexp(uncond_ptr, ov_config.audio_vocab_size) : 0.0;
+                            double combined_log_z_max = -std::numeric_limits<double>::infinity();
+                            double combined_log_z_sum = 0.0;
+                            double best_raw_score = -std::numeric_limits<double>::infinity();
+
+                            for (int v = 0; v < ov_config.audio_vocab_size; v++)
+                            {
+                                if (v == ov_config.audio_mask_id)
+                                    continue;
+
+                                const double cond_log_prob = (double)cond_ptr[v] - cond_log_z;
+                                double combined_raw = cond_log_prob;
+                                if (use_cfg)
+                                {
+                                    const double uncond_log_prob = (double)uncond_ptr[v] - uncond_log_z;
+                                    combined_raw += options.guidance_scale * (cond_log_prob - uncond_log_prob);
+                                }
+
+                                if (combined_raw > best_raw_score)
+                                {
+                                    best_raw_score = combined_raw;
+                                    best_token = v;
+                                }
+                                detail::logsumexp_update(combined_raw, combined_log_z_max, combined_log_z_sum);
+                            }
+
+                            const double combined_log_z = combined_log_z_max + std::log(combined_log_z_sum);
+                            best_score = best_raw_score - combined_log_z;
+                        }
+                        else
+                        {
+                            if (use_cfg)
+                            {
+                                detail::log_softmax(cond_ptr, ov_config.audio_vocab_size, cond_log_probs);
+                                detail::log_softmax(uncond_ptr, ov_config.audio_vocab_size, uncond_log_probs);
+                                combined_log_probs.resize(ov_config.audio_vocab_size);
+                                tmp_combined_logits.resize(ov_config.audio_vocab_size);
+                                for (int v = 0; v < ov_config.audio_vocab_size; v++)
+                                {
+                                    combined_log_probs[v] = cond_log_probs[v] + options.guidance_scale * (cond_log_probs[v] - uncond_log_probs[v]);
+                                    tmp_combined_logits[v] = (float)combined_log_probs[v];
+                                }
+                                detail::log_softmax(tmp_combined_logits.data(), ov_config.audio_vocab_size, combined_log_probs);
+                            }
+                            else
+                            {
+                                detail::log_softmax(cond_ptr, ov_config.audio_vocab_size, combined_log_probs);
+                            }
+
+                            combined_log_probs[ov_config.audio_mask_id] = -std::numeric_limits<double>::infinity();
+
                             int top_k = std::max(1, (int)std::ceil(ov_config.audio_vocab_size * 0.1));
-                            std::vector<int> order(ov_config.audio_vocab_size);
-                            std::iota(order.begin(), order.end(), 0);
-                            std::partial_sort(order.begin(), order.begin() + top_k, order.end(),
+                            top_order.resize(ov_config.audio_vocab_size);
+                            std::iota(top_order.begin(), top_order.end(), 0);
+                            std::partial_sort(top_order.begin(), top_order.begin() + top_k, top_order.end(),
                                 [&](int a, int b) { return combined_log_probs[a] > combined_log_probs[b]; });
                             for (int i = 0; i < top_k; i++)
                             {
-                                int token_id = order[i];
+                                int token_id = top_order[i];
                                 double sampled = combined_log_probs[token_id] / options.class_temperature + detail::sample_gumbel(rng);
                                 if (sampled > best_score)
                                 {
@@ -1373,17 +1459,6 @@ namespace chatllm::omnivoice
                                 }
                             }
                             best_score = combined_log_probs[best_token];
-                        }
-                        else
-                        {
-                            for (int v = 0; v < ov_config.audio_vocab_size; v++)
-                            {
-                                if (combined_log_probs[v] > best_score)
-                                {
-                                    best_score = combined_log_probs[v];
-                                    best_token = v;
-                                }
-                            }
                         }
 
                         predicted[flat_idx] = best_token;
@@ -1417,7 +1492,8 @@ namespace chatllm::omnivoice
                 }
 
                 update_target_audio_ids(cond, tokens);
-                update_target_audio_ids(uncond, tokens);
+                if (use_cfg)
+                    update_target_audio_ids(uncond, tokens);
             }
 
             std::vector<float> pcm_samples;
@@ -1572,6 +1648,7 @@ namespace chatllm::omnivoice
         bool run_model_logits(const GenerationConfig &gen_config, const SequenceInputs &inputs, std::vector<float> &output)
         {
             const int seq_len = (int)inputs.text_ids.size();
+            CHATLLM_CHECK(inputs.target_len > 0) << "OmniVoice target_len must be positive";
 
             ForwardContext ctx(&backend_context);
             ctx.user_options = w_ctx_.user_options;
@@ -1580,6 +1657,9 @@ namespace chatllm::omnivoice
 
             set_dbg_ctx(&ctx);
             transformer->set_ctx(seq_len);
+            LMFinalSteps *steps = dynamic_cast<LMFinalSteps *>(transformer->get_final_steps());
+            if (steps)
+                steps->set_read_last_n(inputs.target_len);
 
             ctx.move_to_layer(LayerAllocatorManager::MiscLayer::Prolog);
             ggml::tensor *text_ids_tensor = ggml::new_tensor_1d(&ctx, GGML_TYPE_I32, seq_len);
@@ -1608,7 +1688,7 @@ namespace chatllm::omnivoice
             ggml::tensor *hidden_states = transformer->last_hidden_state;
             CHATLLM_CHECK(hidden_states != nullptr) << "OmniVoice hidden states are unavailable";
             r = audio_heads.forward(&ctx, hidden_states);
-            r = ggml::reshape_3d(&ctx, r, ov_config.audio_vocab_size, ov_config.num_audio_codebook, seq_len);
+            r = ggml::reshape_3d(&ctx, r, ov_config.audio_vocab_size, ov_config.num_audio_codebook, inputs.target_len);
 
             if (ggml::type_of(r) != GGML_TYPE_F32)
             {
@@ -1625,6 +1705,8 @@ namespace chatllm::omnivoice
             {
                 set_dbg_ctx(nullptr);
                 transformer->custom_embedding = nullptr;
+                if (steps)
+                    steps->set_read_last_n(ov_config.max_length);
                 return false;
             }
 
@@ -1643,6 +1725,8 @@ namespace chatllm::omnivoice
             Backend::read_tensor_data(r, output.data());
 
             transformer->custom_embedding = nullptr;
+            if (steps)
+                steps->set_read_last_n(ov_config.max_length);
             set_dbg_ctx(nullptr);
             ctx.reset();
             return true;

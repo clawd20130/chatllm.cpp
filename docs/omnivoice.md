@@ -125,8 +125,9 @@ ffmpeg -y -f s16le -ar 24000 -ac 1 -i /tmp/out.pcm /tmp/out.wav
 One benchmarking caveat:
 
 * `main --tts_export ...` still calls `ffplay` after synthesis when `ffplay` is available.
-* End-to-end CLI wall time therefore includes audio playback time unless playback is disabled or stubbed out.
-* For pure generation benchmarks, keep the model resident in one process and neutralize `ffplay`.
+* End-to-end CLI wall time therefore includes audio playback time unless playback is disabled.
+* `--no_play` now disables `ffplay` without stubbing binaries out.
+* For pure generation benchmarks, keep the model resident in one process and use `--no_play`.
 
 ## Vulkan Benchmark Notes
 
@@ -142,13 +143,23 @@ Measured on this machine with:
 Observed numbers:
 
 * end-to-end CLI timing after warmup, including process startup and post-generation playback path: about `20.8s` wall time for `8.6s` audio, or `RTF ~= 2.42`
-* pure generation timing with one resident interactive process and `ffplay` stubbed out: about `12.3s` wall time for `8.6s` audio, or `RTF ~= 1.43`
+* earlier pure generation timing with one resident interactive process: about `12.3s` wall time for `8.6s` audio, or `RTF ~= 1.43`
+* current stable pure generation timing after adding `--no_play` and a CPU scoring fast path:
+  * setup: one resident interactive process, `2` warmup runs, then `5` measured runs
+  * average: `10.98s` wall time for `8.6s` audio, or `RTF ~= 1.28`
+  * stable tail (`runs 3-5`): `11.05s` wall time for `8.6s` audio, or `RTF ~= 1.28`
 
 Interpretation:
 
 * on this 780M Vulkan path, native OmniVoice auto TTS is not yet real-time at `num_step=32`
-* pure generation speed is about `0.70x` real-time
+* stable pure generation speed is now about `0.78x` real-time
+* relative to the previous `RTF ~= 1.43` baseline, the current stable path is about `10.8%` faster
 * end-to-end shell timing overstates model cost if audio playback is not excluded
+
+One optimization experiment did not survive:
+
+* batching CFG conditional and unconditional branches with per-batch attention masks matched the Python reference structure
+* on this current Vulkan 780M path, that version regressed wall time, so it was not kept as the default runtime path
 
 ## Validation Commands
 

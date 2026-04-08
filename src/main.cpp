@@ -107,6 +107,7 @@ struct Args
     bool single_turn = false;
     bool opt_speed   = true;
     std::string flash_attention = "";
+    bool no_play = false;
 };
 
 #define MULTI_LINE_END_MARKER_W  L"\\."
@@ -380,6 +381,7 @@ void usage(const std::string &prog)
               << "                          multimedia file tags. Default: Not set. Example {{ }}: {{TAG:/path/to/image.png}}\n"
               << "                          where TAG ::= image | video | audio\n"
               << "  --tts_export FILE       save generated PCM samples into a file. (default: not save)                                 [*]\n"
+              << "  --no_play               do not play generated audio with ffplay; useful for benchmarking                             [*]\n"
               << "Session:\n"
               << "  --save_session N FILE   save session to FILE after N round(s) of chatting (N >= 0) and quit                         [*]\n"
               << "                          when N = 0, system prompt is evaluated.\n"
@@ -495,6 +497,7 @@ static size_t parse_args(Args &args, const std::vector<std::string> &argv)
             handle_flag(moe_on_cpu)
             handle_flag(detect_thoughts)
             handle_flag(single_turn)
+            handle_flag(no_play)
             else if (utils::is_same_command_option(arg, "--format"))
             {
                 c++;
@@ -882,12 +885,18 @@ static void print_embedding(const std::vector<float> &data, std::ostream &cout)
     cout << std::endl;
 }
 
-static void play_audio(const std::vector<int16_t> &data, const int sample_rate, const int channels, TextStreamer &streamer, std::string export_fn)
+static void play_audio(const std::vector<int16_t> &data, const int sample_rate, const int channels, TextStreamer &streamer, std::string export_fn, bool play_output = true)
 {
+    if (!play_output && export_fn.empty())
+        return;
+
     auto fn = export_fn.size() > 0 ? export_fn : utils::tmpname();
     std::ofstream file(fn, std::ios::binary);
     file.write((const char *)data.data(), data.size() * sizeof(data[0]));
     file.close();
+
+    if (!play_output)
+        return;
 
     char cmd[2048];
     sprintf(cmd, "ffplay -loglevel error -autoexit -f s16le -ch_layout %s -sample_rate %d \"%s\"", channels == 1 ? "mono" : "stereo", sample_rate, fn.c_str());
@@ -898,8 +907,15 @@ static void play_audio(const std::vector<int16_t> &data, const int sample_rate, 
         streamer.cout << "FAILED to play audio. Please check ffplay is installed." << std::endl;
 }
 
-static void play_audio_file(const std::string &fn, TextStreamer &streamer, bool remove_after)
+static void play_audio_file(const std::string &fn, TextStreamer &streamer, bool remove_after, bool play_output = true)
 {
+    if (!play_output)
+    {
+        if (remove_after)
+            std::remove(fn.c_str());
+        return;
+    }
+
     std::string cmd = "ffplay -loglevel error -autoexit " + shell_quote(fn);
     int r = system(cmd.c_str());
     if (remove_after)
@@ -1023,7 +1039,7 @@ static void run_omnivoice_bridge(Args &args, TextStreamer &streamer, const std::
     {
         const std::string export_fn = args.tts_export.size() > 0 ? args.tts_export : utils::tmpname() + ".wav";
         run_omnivoice_bridge_once(prompt, export_fn, args, streamer, prog_path);
-        play_audio_file(export_fn, streamer, args.tts_export.empty());
+        play_audio_file(export_fn, streamer, args.tts_export.empty(), !args.no_play);
     };
 
     if (!args.interactive)
@@ -1056,7 +1072,7 @@ static void run_tts(Args &args, chatllm::Pipeline &pipeline, TextStreamer &strea
     if (!args.interactive)
     {
         pipeline.speech_synthesis(args.prompt, gen_config, result, sample_rate, channels);
-        play_audio(result, sample_rate, channels, streamer, args.tts_export);
+        play_audio(result, sample_rate, channels, streamer, args.tts_export, !args.no_play);
         return;
     }
 
@@ -1075,7 +1091,7 @@ static void run_tts(Args &args, chatllm::Pipeline &pipeline, TextStreamer &strea
         pipeline.speech_synthesis(input, gen_config, result, sample_rate, channels);
         streamer.cout << "      > ";
 
-        play_audio(result, sample_rate, channels, streamer, args.tts_export);
+        play_audio(result, sample_rate, channels, streamer, args.tts_export, !args.no_play);
 
     }
     streamer.cout << "Bye\n";
