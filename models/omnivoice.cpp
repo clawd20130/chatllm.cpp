@@ -38,6 +38,7 @@ namespace chatllm::omnivoice
         bool denoise = true;
         bool preprocess_prompt = true;
         bool postprocess_output = true;
+        bool experimental_device_cfg_greedy = false;
     };
 
     namespace detail
@@ -1375,6 +1376,7 @@ namespace chatllm::omnivoice
             options.denoise = utils::get_opt(args, "denoise", options.denoise);
             options.preprocess_prompt = utils::get_opt(args, "preprocess_prompt", options.preprocess_prompt);
             options.postprocess_output = utils::get_opt(args, "postprocess_output", options.postprocess_output);
+            options.experimental_device_cfg_greedy = utils::get_opt(args, "experimental_device_cfg_greedy", options.experimental_device_cfg_greedy);
 
             if (options.duration <= 0.0)
                 options.duration = -1.0;
@@ -1423,7 +1425,10 @@ namespace chatllm::omnivoice
             }
 
             std::mt19937 rng(gen_config.get_seed());
-            const bool use_device_cfg_greedy = use_cfg && (options.class_temperature <= 0.0);
+            // Keep the device-side greedy CFG path behind an explicit opt-in until it matches
+            // the host logits path. The current implementation can corrupt token indices.
+            const bool use_device_cfg_greedy =
+                use_cfg && (options.class_temperature <= 0.0) && options.experimental_device_cfg_greedy;
             CFGGreedyCache cfg_greedy_cache(this);
             for (int step = 0; step < options.num_step; step++)
             {
